@@ -156,6 +156,7 @@ from graphify.extractors.resolution import (  # noqa: E402,F401
     _resolve_cross_file_java_imports,
     _resolve_export_target,
     _resolve_go_type_references,
+    _resolve_swift_type_references,
     _resolve_java_type_references,
     _resolve_php_type_references,
     _resolve_js_import_path,
@@ -4094,7 +4095,9 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
             ) and not _cross_language_candidate(edge, remapped_source):
                 edge["source"] = remapped_source
         target = edge.get("target")
-        if target in remap:
+        # A Swift edge the Swift lookup declined (ambiguous / unresolved) stays
+        # on its stub: a bare label may not mean the one same-named nested type.
+        if target in remap and not edge.get("_swift_lookup"):
             remapped_target = remap[str(target)]
             if not (
                 is_csharp_scoped_edge
@@ -10231,6 +10234,22 @@ def extract(
             logging.getLogger(__name__).warning(
                 "Go type-reference resolution failed, skipping: %s", exc
             )
+    # Bind Swift type references by Swift name lookup (innermost scope first)
+    # before the generic bare-label rewire; edges the lookup declines carry
+    # `_swift_lookup` so the rewire leaves them on their stub.
+    _swift_sel = [(r, p) for r, p in zip(per_file, paths) if effective_suffix(p) == ".swift"]
+    if _swift_sel:
+        try:
+            _resolve_swift_type_references(
+                [r for r, _ in _swift_sel], [p for _, p in _swift_sel],
+                all_nodes, all_edges, root,
+                resolution_context_nodes, resolution_context_edges,
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Swift type-reference resolution failed, skipping: %s", exc
+            )
     # Cross-file Python import resolution and type-reference repointing (#3252)
     py_paths = [p for p in paths if effective_suffix(p) == ".py"]
     if py_paths:
@@ -10894,6 +10913,9 @@ def extract(
     for e in all_edges:
         e.pop("_rust_use_binding", None)
         e.pop("_rust_use_name", None)
+        # Run-local Swift lookup state; every resolver and the rewire are done.
+        e.pop("_swift_scope", None)
+        e.pop("_swift_lookup", None)
 
     # Relativize source_file fields so paths are portable across machines (#555).
     # When the node's id was itself minted from the absolute path, remap it to a
