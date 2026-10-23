@@ -5906,6 +5906,11 @@ def _extract_generic(
     # extensions don't (file stem is part of the id), so they're collected here
     # for a corpus-level merge after every file has been parsed.
     swift_extensions: list[dict] = []
+    # Ids of this file's real Swift declarations (class/struct/enum/actor and
+    # protocol). An `extension Foo` in the same file mints the same id, so the
+    # set is what tells a declared type from one that only extensions created;
+    # read after the walk, since the extension may precede the declaration.
+    swift_declared_nids: set[str] = set()
     # C# type id -> its name within the namespace, enclosing types first
     # (`` Outer`1.Inner ``). Partial types carry it as `type_path` so the
     # corpus-level partial merge can key nested and generic halves exactly.
@@ -6284,10 +6289,16 @@ def _extract_generic(
                 _ts_emit_decorator_edges(node, class_nid, stem, source,
                                          ensure_named_node, add_edge)
 
-            if config.ts_module == "tree_sitter_swift" and any(
-                c.type == "extension" for c in node.children
-            ):
-                swift_extensions.append({"nid": class_nid, "label": class_name})
+            if config.ts_module == "tree_sitter_swift":
+                if t == "protocol_declaration" or _swift_declaration_keyword(node) in (
+                    "class", "struct", "enum", "actor",
+                ):
+                    swift_declared_nids.add(class_nid)
+                elif any(c.type == "extension" for c in node.children):
+                    # `declared` is filled in after the walk (see above).
+                    swift_extensions.append(
+                        {"nid": class_nid, "label": class_name, "declared": False}
+                    )
 
             # Python-specific: inheritance
             if config.ts_module == "tree_sitter_python":
@@ -10225,6 +10236,18 @@ def _extract_generic(
                     # guard excludes these to avoid false edges (#2137).
                     n["_callable_class"] = True
     if swift_extensions:
+        # An id is extension-only when no declaration in this file shares it.
+        # Such a node is not a declaration: the corpus merge never picks it as
+        # canonical and the stub rewire never binds other files' references to
+        # it (`extension View` / `extension String` of an outside type).
+        extension_only_nids: set[str] = set()
+        for ext in swift_extensions:
+            ext["declared"] = ext["nid"] in swift_declared_nids
+            if not ext["declared"]:
+                extension_only_nids.add(ext["nid"])
+        for n in nodes:
+            if n["id"] in extension_only_nids and n.get("source_file"):
+                n["_swift_extension_only"] = True
         result["swift_extensions"] = swift_extensions
     # TS/JS: augment the constructor-injection type table with local `new`
     # bindings and type-annotated parameters, so `const s = new Svc(); s.m()` and
