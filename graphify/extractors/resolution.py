@@ -3566,8 +3566,8 @@ class SwiftTypeIndex(NamedTuple):
 
     # qualified path ("PaneLayout.Pane") -> distinct node ids, sorted
     by_path: dict[str, list[str]]
-    # last path segment ("Pane") -> node ids, one entry per distinct path, so a
-    # node declared under 2+ paths appears 2+ times; sorted
+    # last path segment ("Pane") -> node ids, sorted; a node declared under 2+
+    # paths appears that many times under each of its last segments
     by_label: dict[str, list[str]]
 
 
@@ -3592,10 +3592,18 @@ def _swift_type_index(nodes: list[dict]) -> SwiftTypeIndex:
             if path:
                 seen.add((str(path), str(nid)))
     by_path: dict[str, list[str]] = {}
-    by_label: dict[str, list[str]] = {}
+    labels_by_nid: dict[str, set[str]] = {}
+    path_count: dict[str, int] = {}
     for path, nid in sorted(seen):
         by_path.setdefault(path, []).append(nid)
-        by_label.setdefault(path.rsplit(".", 1)[-1], []).append(nid)
+        labels_by_nid.setdefault(nid, set()).add(path.rsplit(".", 1)[-1])
+        path_count[nid] = path_count.get(nid, 0) + 1
+    by_label: dict[str, list[str]] = {}
+    for nid, labels in labels_by_nid.items():
+        for label in labels:
+            # One entry per declared path under every label of the node, so
+            # paths with different last segments (caseless id fold) still show.
+            by_label.setdefault(label, []).extend([nid] * path_count[nid])
     for label_nids in by_label.values():
         label_nids.sort()
     return SwiftTypeIndex(by_path, by_label)

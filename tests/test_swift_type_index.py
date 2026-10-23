@@ -118,6 +118,15 @@ def test_node_with_two_paths_is_ambiguous_whenever_hit():
     assert _swift_lookup(index, "State", "") == ("unresolved", None)
 
 
+def test_two_paths_with_different_last_segments_are_ambiguous():
+    # Caseless ids fold `struct Config` and `enum CONFIG` onto one node.
+    index = _swift_type_index([_node("same", ["A.Foo", "B.FOO"])])
+    assert _swift_lookup(index, "A.Foo", "") == ("ambiguous", None)
+    assert _swift_lookup(index, "B.FOO", "") == ("ambiguous", None)
+    assert _swift_lookup(index, "Foo", "A") == ("ambiguous", None)
+    assert _swift_lookup(index, "FOO", "B") == ("ambiguous", None)
+
+
 def test_same_node_listed_twice_is_one_candidate():
     node = _node("pane", ["PaneLayout.Pane"])
     index = _swift_type_index([node, dict(node)])
