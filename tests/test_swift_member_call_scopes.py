@@ -82,3 +82,78 @@ def test_member_call_dotted_type_does_not_bind_concatenated_label(tmp_path: Path
     for e in result["edges"]:
         if e.get("source") == run_nids[0]:
             assert e["target"] not in wrong_go | wrong_type
+
+
+def test_static_call_to_nested_type_binds_nested_not_shadowing_top_level(tmp_path: Path):
+    # `Inner.go()` written inside `extension Outer` is looked up from Outer, so it
+    # binds Outer.Inner even when a top-level `Inner` exists.
+    base = tmp_path / "src"
+    nested = _write(base / "Outer.swift", (
+        "struct Outer {\n"
+        "    struct Inner {\n"
+        "        static func go() {}\n"
+        "    }\n"
+        "}\n"
+    ))
+    top = _write(base / "Inner.swift", "struct Inner {\n    static func go() {}\n}\n")
+    ext = _write(base / "OuterExt.swift", (
+        "extension Outer {\n"
+        "    func f() {\n"
+        "        Inner.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([nested, top, ext], tmp_path)
+
+    f_nids = _nodes_by_file(result, ext, ".f()")
+    assert len(f_nids) == 1
+    targets = _call_targets(result, f_nids[0])
+    assert set(_nodes_by_file(result, nested, ".go()")) <= targets
+    assert not (set(_nodes_by_file(result, top, ".go()")) & targets)
+
+
+def test_factory_returned_nested_type_receiver_binds_return_target(tmp_path: Path):
+    base = tmp_path / "src"
+    outer = _write(base / "Outer.swift", (
+        "struct Outer {\n"
+        "    struct Inner {\n"
+        "        func go() {}\n"
+        "    }\n"
+        "}\n"
+    ))
+    factory = _write(base / "ServiceFactory.swift", (
+        "class ServiceFactory {\n"
+        "    static func make() -> Outer.Inner {\n"
+        "        return Outer.Inner()\n"
+        "    }\n"
+        "}\n"
+    ))
+    consumer = _write(base / "Consumer.swift", (
+        "struct Consumer {\n"
+        "    func run() {\n"
+        "        let x = ServiceFactory.make()\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([outer, factory, consumer], tmp_path)
+
+    run_nids = _nodes_by_file(result, consumer, ".run()")
+    assert len(run_nids) == 1
+    assert set(_nodes_by_file(result, outer, ".go()")) <= _call_targets(result, run_nids[0])
+
+
+def test_python_static_call_does_not_bind_swift_type(tmp_path: Path):
+    # raw calls of every language share the resolver; a Python `Inner.go()` must
+    # not reach the same-named Swift type through the Swift index.
+    base = tmp_path / "src"
+    swift = _write(base / "Inner.swift", "class Inner {\n    static func go() {}\n}\n")
+    py_def = _write(base / "inner.py", "class Inner:\n    @staticmethod\n    def go():\n        pass\n")
+    py_use = _write(base / "use.py", "def run():\n    Inner.go()\n")
+    result = _run([swift, py_def, py_use], tmp_path)
+
+    swift_go = set(_nodes_by_file(result, swift, ".go()")) | set(_nodes_by_file(result, swift, "Inner"))
+    callers = [n["id"] for n in result["nodes"] if str(n.get("source_file", "")).endswith("use.py")]
+    for e in result["edges"]:
+        if e.get("source") in callers:
+            assert e["target"] not in swift_go
