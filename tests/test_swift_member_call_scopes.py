@@ -157,3 +157,76 @@ def test_python_static_call_does_not_bind_swift_type(tmp_path: Path):
     for e in result["edges"]:
         if e.get("source") in callers:
             assert e["target"] not in swift_go
+
+
+def test_uppercase_static_factory_keeps_return_type_binding(tmp_path: Path):
+    # `Factory.Make()` is recorded as the dotted path "Factory.Make" (АР12); it
+    # names no type, so it is retried as factory `Factory`, method `Make`.
+    base = tmp_path / "src"
+    types = _write(base / "Types.swift", (
+        "class Widget {\n"
+        "    func go() {}\n"
+        "}\n"
+        "class Factory {\n"
+        "    static func Make() -> Widget {\n"
+        "        return Widget()\n"
+        "    }\n"
+        "}\n"
+    ))
+    consumer = _write(base / "Consumer.swift", (
+        "struct Consumer {\n"
+        "    func run() {\n"
+        "        let x = Factory.Make()\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([types, consumer], tmp_path)
+
+    run_nids = _nodes_by_file(result, consumer, ".run()")
+    assert len(run_nids) == 1
+    go_nids = _nodes_by_file(result, types, ".go()")
+    assert len(go_nids) == 1
+    assert go_nids[0] in _call_targets(result, run_nids[0])
+
+
+def test_factory_return_nested_type_with_top_level_namesake_binds(tmp_path: Path):
+    # The fold binds the exact return nid, so a top-level `Inner` beside
+    # `Outer.Inner` must not void the binding, nor receive the call.
+    base = tmp_path / "src"
+    outer = _write(base / "Outer.swift", (
+        "struct Outer {\n"
+        "    struct Inner {\n"
+        "        func go() {}\n"
+        "    }\n"
+        "}\n"
+    ))
+    top = _write(base / "Inner.swift", (
+        "struct Inner {\n"
+        "    func go() {}\n"
+        "}\n"
+    ))
+    factory = _write(base / "ServiceFactory.swift", (
+        "class ServiceFactory {\n"
+        "    static func make() -> Outer.Inner {\n"
+        "        return Outer.Inner()\n"
+        "    }\n"
+        "}\n"
+    ))
+    consumer = _write(base / "Consumer.swift", (
+        "struct Consumer {\n"
+        "    func run() {\n"
+        "        let x = ServiceFactory.make()\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([outer, top, factory, consumer], tmp_path)
+
+    run_nids = _nodes_by_file(result, consumer, ".run()")
+    assert len(run_nids) == 1
+    targets = _call_targets(result, run_nids[0])
+    nested_go = _nodes_by_file(result, outer, ".go()")
+    assert len(nested_go) == 1
+    assert nested_go[0] in targets
+    assert not set(_nodes_by_file(result, top, ".go()")) & targets

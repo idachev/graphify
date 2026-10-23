@@ -4631,7 +4631,8 @@ def _resolve_swift_member_calls(
     # (`swift_plain_return` on the return_type references edge) and fold the
     # result into the declaring file's table so the raw-call loop below types
     # `x.method()` through the existing INFERRED path. Every step is
-    # exactly-one guarded; any failure leaves the receiver untyped (no edge,
+    # exactly-one guarded (the return target by identity: it must be a real
+    # type definition); any failure leaves the receiver untyped (no edge,
     # never a wrong one). setdefault: an explicit annotation wins.
     factory_by_file: dict[str, dict] = {}
     # (file, receiver) -> the factory's resolved return type nid: the label folded
@@ -4642,48 +4643,92 @@ def _resolve_swift_member_calls(
         tt = result.get("swift_type_table")
         if tt and tt.get("path") and tt.get("factory"):
             factory_by_file[tt["path"]] = tt["factory"]
-    if factory_by_file:
-        # method nid -> marked plain-return target nids (must be exactly one).
-        return_targets_by_method: dict[str, set[str]] = {}
-        for e in all_edges:
-            if (e.get("relation") == "references"
-                    and e.get("context") == "return_type"
-                    and (e.get("metadata") or {}).get("swift_plain_return")):
-                return_targets_by_method.setdefault(
-                    e.get("source"), set()).add(e.get("target"))
-        for path, pending in factory_by_file.items():
-            # Copy before folding: the resolved label is corpus-dependent and
-            # must not leak back into the per-file result.
-            table = dict(type_table_by_file.get(path, {}))
-            type_table_by_file[path] = table
-            for receiver, bind in pending.items():
-                try:
-                    factory_type, factory_method = bind
-                except (TypeError, ValueError):
-                    continue
-                if factory_type in _LANGUAGE_BUILTIN_GLOBALS:
-                    continue
-                factory_defs = type_def_nids.get(_key(factory_type), [])
-                if len(factory_defs) != 1:
-                    continue
-                method_nid = method_index.get((factory_defs[0], _key(factory_method)))
-                if method_nid is None:
-                    continue
-                targets = return_targets_by_method.get(method_nid, set())
-                if len(targets) != 1:
-                    continue
-                ret_nid = next(iter(targets))
-                tnode = node_by_id.get(ret_nid)
-                ret_label = str(tnode.get("label", "")) if tnode else ""
-                if not ret_label or ret_label in _LANGUAGE_BUILTIN_GLOBALS:
-                    continue
-                if len(type_def_nids.get(_key(ret_label), [])) != 1:
-                    continue
-                if receiver not in table:
-                    table[receiver] = ret_label
-                    factory_typed[(path, receiver)] = ret_nid
-
     swift_index = _swift_type_index(all_nodes)
+    # method nid -> marked plain-return target nids (must be exactly one).
+    return_targets_by_method: dict[str, set[str]] = {}
+    for e in all_edges:
+        if (e.get("relation") == "references"
+                and e.get("context") == "return_type"
+                and (e.get("metadata") or {}).get("swift_plain_return")):
+            return_targets_by_method.setdefault(
+                e.get("source"), set()).add(e.get("target"))
+
+    def _factory_return(
+        factory_defs: list[str], factory_method: str,
+    ) -> tuple[str, str] | None:
+        # (label, nid) of the one plain return type of `factory_method` on the
+        # one factory type; None when any step is not exactly one.
+        if len(factory_defs) != 1:
+            return None
+        method_nid = method_index.get((factory_defs[0], _key(factory_method)))
+        if method_nid is None:
+            return None
+        targets = return_targets_by_method.get(method_nid, set())
+        if len(targets) != 1:
+            return None
+        ret_nid = next(iter(targets))
+        tnode = node_by_id.get(ret_nid)
+        ret_label = str(tnode.get("label", "")) if tnode else ""
+        if not ret_label or ret_label in _LANGUAGE_BUILTIN_GLOBALS:
+            return None
+        # Identity, not label uniqueness: `ret_nid` is bound directly, so a
+        # same-named type elsewhere (top-level `Inner` beside `Outer.Inner`)
+        # must not void it; a shadow or stub target is still refused.
+        if ret_nid not in type_def_nids.get(_key(ret_label), []):
+            return None
+        return ret_label, ret_nid
+
+    for path, pending in factory_by_file.items():
+        # Copy before folding: the resolved label is corpus-dependent and
+        # must not leak back into the per-file result.
+        table = dict(type_table_by_file.get(path, {}))
+        type_table_by_file[path] = table
+        for receiver, bind in pending.items():
+            try:
+                factory_type, factory_method = bind
+            except (TypeError, ValueError):
+                continue
+            if factory_type in _LANGUAGE_BUILTIN_GLOBALS:
+                continue
+            ret = _factory_return(type_def_nids.get(_key(factory_type), []), factory_method)
+            if ret is not None and receiver not in table:
+                table[receiver] = ret[0]
+                factory_typed[(path, receiver)] = ret[1]
+
+    # A dotted constructor value (`let x = Factory.Make()` records
+    # "Factory.Make", АР12) that names no Swift type is a static factory with
+    # an upper-cased method: retry it as factory `Factory`, method `Make`.
+    # Unresolved here keeps the written path for the lookup below.
+    for path in sorted(type_table_by_file):
+        written = type_table_by_file[path]
+        scopes = scopes_by_file.get(path, {})
+        table = None
+        for receiver, type_name in written.items():
+            if (not isinstance(type_name, str) or "." not in type_name
+                    or (path, receiver) in factory_typed):
+                continue
+            scope = scopes.get(receiver, "")
+            if _swift_lookup(swift_index, type_name, scope)[0] == "resolved":
+                continue
+            factory_type, factory_method = type_name.rsplit(".", 1)
+            if factory_type in _LANGUAGE_BUILTIN_GLOBALS:
+                continue
+            status, factory_nid = _swift_lookup(swift_index, factory_type, scope)
+            if status == "resolved":
+                factory_defs = [factory_nid]
+            elif status == "external" and "." not in factory_type:
+                factory_defs = type_def_nids.get(_key(factory_type), [])
+            else:
+                continue
+            ret = _factory_return(factory_defs, factory_method)
+            if ret is None:
+                continue
+            if table is None:
+                table = dict(written)
+            table[receiver] = ret[0]
+            factory_typed[(path, receiver)] = ret[1]
+        if table is not None:
+            type_table_by_file[path] = table
 
     all_raw_calls: list[dict] = []
     for result in per_file:
