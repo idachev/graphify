@@ -4733,6 +4733,31 @@ def _resolve_swift_member_calls(
         })
 
 
+def _swift_caller_scope(
+    caller_nid: str, method_owner: dict[str, str], node_by_id: dict[str, dict],
+) -> str | None:
+    """The qualified Swift type path a call inside ``caller_nid`` is looked up from.
+
+    A caller that is itself a Swift type (a property initializer is recorded on
+    the type node) uses its own single ``_swift_qualified`` path. A method or
+    nested function uses the single path of the type that owns it through a
+    ``method`` / ``contains`` edge (``method_owner``: member nid -> owner nid,
+    file nodes excluded). A caller with no owner is file-scope code: ``""``.
+    ``None`` when the path is not unique (0 or 2+ distinct paths): no Swift
+    binding is attempted for that call.
+    """
+    caller = node_by_id.get(caller_nid)
+    if caller is not None and caller.get("_swift_qualified"):
+        own_paths = list(dict.fromkeys(caller["_swift_qualified"]))
+        return own_paths[0] if len(own_paths) == 1 else None
+    owner_nid = method_owner.get(caller_nid)
+    if owner_nid is None:
+        return ""
+    owner = node_by_id.get(owner_nid) or {}
+    owner_paths = list(dict.fromkeys(owner.get("_swift_qualified") or ()))
+    return owner_paths[0] if len(owner_paths) == 1 else None
+
+
 def _stamp_python_fixture_paths(per_file: "list[dict | None]", root: Path) -> None:
     """Repo-relative locations for the pytest-fixture arm of
     _resolve_python_member_calls. A re-extracted file carries absolute paths while
@@ -10504,6 +10529,10 @@ def extract(
     _csharp_stub_resolver: CsharpNameResolver | None = None  # built on first use
     _csharp_method_owner: dict[str, str] | None = None  # method nid -> type nid, built on first use
     _csharp_outer_type: dict[str, str] | None = None  # nested type nid -> outer type label, built on first use
+    # Swift constructor-call lookup state, all three built together on first use.
+    _swift_index = None  # SwiftTypeIndex over resolution_nodes
+    _swift_member_owner: dict[str, str] = {}  # member nid -> owning node nid (file nodes excluded)
+    _swift_node_by_id: dict[str, dict] = {}  # resolution node by id
     for rc in all_raw_calls:
         if rc.get("_ambiguous_python_import"):
             continue
@@ -10548,6 +10577,57 @@ def extract(
         # `close` and `delete` are ordinary method names elsewhere (#2296).
         if rc.get("language") == "go" and callee in _GO_PREDECLARED_FUNCS:
             continue
+        # Swift `Foo(...)` constructs the type the caller's lexical scope sees,
+        # not whatever shares the name corpus-wide. Swift raw_calls carry no
+        # `lang` tag, so the file suffix selects them. A lexical hit is the
+        # evidence (the Swift counterpart of the C# `stub_scope_hit` below) and
+        # replaces the `via_stub` gate; the call stays INFERRED because `Foo(...)`
+        # could also be a free function or a static `callAsFunction`. A name the
+        # index knows but the scope does not see (or sees twice) gets no edge and
+        # no generic fallback. Only a name the index does not know at all falls
+        # through to the generic resolution (free functions, Objective-C).
+        if str(rc.get("source_file", "")).lower().endswith(".swift"):
+            if _swift_index is None:
+                _swift_index = _swift_type_index(resolution_nodes)
+                _swift_node_by_id.update(
+                    (n["id"], n) for n in resolution_nodes if n.get("id")
+                )
+                _swift_file_nids = set(sf_to_file_nid.values()) | set(nid_to_file_nid.values())
+                for e in all_edges + list(resolution_context_edges or []):
+                    if (
+                        e.get("relation") in ("method", "contains")
+                        and e.get("source") not in _swift_file_nids
+                    ):
+                        _swift_member_owner.setdefault(e["target"], e["source"])
+            swift_scope = _swift_caller_scope(
+                rc.get("caller_nid", ""), _swift_member_owner, _swift_node_by_id,
+            )
+            # A caller whose owner has no single qualified path binds nothing;
+            # its lookup only tells whether the callee is a Swift type at all.
+            swift_status, swift_nid = _swift_lookup(
+                _swift_index, callee, swift_scope if swift_scope is not None else "",
+            )
+            if swift_status != "external":
+                swift_caller = rc["caller_nid"]
+                if (
+                    swift_status == "resolved"
+                    and swift_scope is not None
+                    and swift_nid != swift_caller
+                    and (swift_caller, swift_nid) not in existing_pairs
+                ):
+                    existing_pairs.add((swift_caller, swift_nid))
+                    all_edges.append({
+                        "source": swift_caller,
+                        "target": swift_nid,
+                        "relation": "calls",
+                        "context": "constructor",
+                        "confidence": "INFERRED",
+                        "confidence_score": 0.85,
+                        "source_file": rc.get("source_file", ""),
+                        "source_location": rc.get("source_location"),
+                        "weight": 1.0,
+                    })
+                continue
         # Exact-case match first (case is semantic). Fold only when the CALLING
         # file's language is case-insensitive, and only against the folded index of
         # case-insensitive-language definitions — so a Python `Path()` call can never

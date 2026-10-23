@@ -471,3 +471,96 @@ def test_extension_merge_does_not_prune_unrelated_edges(tmp_path: Path):
         return sum(1 for e in result["edges"] if str(e.get("source_file", "")).endswith(".py"))
 
     assert _py_edges(with_ext) == _py_edges(without_ext), "the extension merge pruned unrelated .py edges"
+
+
+# Phase 4 (RC4): a bare `Foo(...)` in a Swift file binds to the one type the
+# caller's lexical scope sees, as an INFERRED constructor call.
+
+
+def _constructor_calls(result: dict, caller_label: str) -> list[dict]:
+    """The `calls` edges out of the node labelled ``caller_label``."""
+    callers = {n["id"] for n in result["nodes"] if n.get("label") == caller_label}
+    return [
+        e for e in result["edges"]
+        if e.get("relation") == "calls" and e["source"] in callers
+    ]
+
+
+def test_cross_file_constructor_call_emits_inferred_call(tmp_path: Path):
+    # `.reset()` names PaneLayout only in the constructor call, not as a type,
+    # so the (caller, target) pair dedup cannot hide the edge behind a
+    # `references` edge. The caller's file names PaneLayout as a field type
+    # without defining it, which made the call a `via_stub` call that the
+    # import-evidence gate dropped before.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "Models/PaneLayout.swift",
+               "struct PaneLayout {\n    let panes: [Int]\n}\n"),
+        _write(base / "Reducer/LayoutFeature.swift", (
+            "struct LayoutFeature {\n"
+            "    struct State {\n"
+            "        var layout: PaneLayout\n"
+            "    }\n"
+            "    func reset(_ state: inout State) {\n"
+            "        state.layout = PaneLayout(panes: [])\n"
+            "    }\n"
+            "}\n"
+        )),
+    ]
+    result = extract(files, cache_root=tmp_path / "cache", root=base, parallel=False)
+
+    decl_ids = {
+        n["id"] for n in result["nodes"]
+        if n.get("label") == "PaneLayout"
+        and str(n.get("source_file", "")).endswith("Models/PaneLayout.swift")
+    }
+    assert len(decl_ids) == 1
+    calls = [e for e in _constructor_calls(result, ".reset()") if e["target"] in decl_ids]
+    assert len(calls) == 1
+    edge = calls[0]
+    assert edge["context"] == "constructor"
+    assert edge["confidence"] == "INFERRED"
+    assert edge["confidence_score"] == 0.85
+
+
+def test_constructor_call_not_visible_lexically_stays_unresolved(tmp_path: Path):
+    # The only Config is the nested Outer.Config; a bare `Config()` in an
+    # unrelated type cannot see it, so no edge lands on it by name.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "Models/Outer.swift",
+               "struct Outer {\n    struct Config {}\n}\n"),
+        _write(base / "Views/User.swift", (
+            "struct User {\n"
+            "    func make() {\n"
+            "        let c = Config()\n"
+            "    }\n"
+            "}\n"
+        )),
+    ]
+    result = extract(files, cache_root=tmp_path / "cache", root=base, parallel=False)
+
+    config_ids = {n["id"] for n in result["nodes"] if n.get("label") == "Config"}
+    assert config_ids
+    assert [e for e in _constructor_calls(result, ".make()") if e["target"] in config_ids] == []
+
+
+def test_ambiguous_constructor_callee_stays_unresolved(tmp_path: Path):
+    # Two top-level Config types: `Config()` sees both, so it binds to neither.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "a/Config.swift", "struct Config {}\n"),
+        _write(base / "b/Config.swift", "struct Config {}\n"),
+        _write(base / "Views/User.swift", (
+            "struct User {\n"
+            "    func make() {\n"
+            "        let c = Config()\n"
+            "    }\n"
+            "}\n"
+        )),
+    ]
+    result = extract(files, cache_root=tmp_path / "cache", root=base, parallel=False)
+
+    config_ids = {n["id"] for n in result["nodes"] if n.get("label") == "Config"}
+    assert len(config_ids) >= 2
+    assert [e for e in _constructor_calls(result, ".make()") if e["target"] in config_ids] == []
