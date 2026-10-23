@@ -1410,7 +1410,12 @@ def _swift_pre_scan(root_node, source: bytes) -> tuple[set[str], set[str]]:
 
 def _swift_classify_base(name: str, kind: str | None, is_first: bool,
                           protocols: set[str], classes: set[str]) -> str:
-    """Classify a Swift inheritance_specifier entry as `inherits` or `implements`."""
+    """Classify a Swift inheritance_specifier entry as `inherits` or `implements`.
+
+    A dotted base (`Outer.Proto`) is matched on its last segment: the pre-scan
+    collects bare declaration names, and the last segment is the declared one.
+    """
+    name = name.rsplit(".", 1)[-1]
     if name in protocols:
         return "implements"
     if name in classes:
@@ -1421,15 +1426,31 @@ def _swift_classify_base(name: str, kind: str | None, is_first: bool,
     # `class`: first entry is conventionally the base class; subsequent are protocols.
     return "inherits" if is_first else "implements"
 
-def _swift_user_type_name(user_type_node, source: bytes) -> str | None:
-    """Return the head type_identifier text from a Swift user_type node (without generics)."""
-    if user_type_node is None:
-        return None
+def _swift_user_type_segments(user_type_node, source: bytes) -> list[str] | None:
+    """Return the written path segments of a Swift user_type (generics stripped).
+
+    `Outer<A>.Inner<B>` is one user_type whose type_identifier children are the
+    segments; the type_arguments between them are not part of the path. None
+    when there is no segment or a segment reads empty.
+    """
+    segments: list[str] = []
     for c in user_type_node.children:
         if c.type == "type_identifier":
             text = _read_text(c, source)
-            return text or None
-    return None
+            if not text:
+                return None
+            segments.append(text)
+    return segments or None
+
+def _swift_user_type_name(user_type_node, source: bytes) -> str | None:
+    """Return the written dotted path of a Swift user_type node (without generics).
+
+    `Outer.Inner<T>` gives `"Outer.Inner"`, `Base` gives `"Base"`.
+    """
+    if user_type_node is None:
+        return None
+    segments = _swift_user_type_segments(user_type_node, source)
+    return ".".join(segments) if segments else None
 
 def _swift_type_parameters_in_scope(node, source: bytes) -> frozenset[str]:
     """Return Swift generic type-parameter names visible from ``node``.
@@ -1465,7 +1486,13 @@ def _swift_collect_type_refs(node, source: bytes, generic: bool, out: list[tuple
 
     Generic type parameters in scope (``skip``) are local bindings, not
     references; emitting one mints a sourceless stub (the bare `t` god node a
-    `<T>` type or function would otherwise share corpus-wide)."""
+    `<T>` type or function would otherwise share corpus-wide).
+
+    One user_type chain gives ONE entry, its written dotted path (`Outer.Inner`),
+    generics stripped per segment; its generic arguments are separate
+    `generic_arg` entries. A chain whose head is `Self` or a generic parameter
+    in scope (`Self.Element`, `T.Element`) names an associated/member type of a
+    local binding, not a corpus symbol, and gives no entry of its own."""
     if node is None:
         return
     if skip is None:
@@ -1477,12 +1504,9 @@ def _swift_collect_type_refs(node, source: bytes, generic: bool, out: list[tuple
                 _swift_collect_type_refs(c, source, generic, out, skip)
         return
     if t == "user_type":
-        for c in node.children:
-            if c.type == "type_identifier":
-                text = _read_text(c, source)
-                if text and text != "Self" and text not in skip:
-                    out.append((text, "generic_arg" if generic else "type"))
-                break
+        segments = _swift_user_type_segments(node, source)
+        if segments and segments[0] != "Self" and segments[0] not in skip:
+            out.append((".".join(segments), "generic_arg" if generic else "type"))
         for c in node.children:
             if c.type == "type_arguments":
                 for arg in c.children:
@@ -1598,13 +1622,30 @@ def _swift_constructor_type(call_node, source: bytes) -> str | None:
     """If a Swift call expression is a constructor (``Foo()``), return the type name.
 
     Only upper-cased callees are treated as types so a free-function call like
-    ``configure()`` in an initializer is not mistaken for a constructor.
+    ``configure()`` in an initializer is not mistaken for a constructor. A
+    nested type (``Outer.Inner()``) gives its written dotted path when every
+    segment of the callee chain is an upper-cased identifier; ``Factory.make()``
+    (a lower-cased last segment) stays a factory call.
     """
     first = call_node.children[0] if call_node.children else None
-    if first is not None and first.type == "simple_identifier":
-        text = _read_text(first, source)
-        if text and text[:1].isupper():
-            return text
+    if first is None:
+        return None
+    segments: list[str] = []
+    while first.type == "navigation_expression":
+        named = [c for c in first.children if c.is_named]
+        if len(named) != 2 or named[1].type != "navigation_suffix":
+            return None
+        ident = next((sc for sc in named[1].children
+                      if sc.type == "simple_identifier"), None)
+        if ident is None:
+            return None
+        segments.append(_read_text(ident, source))
+        first = named[0]
+    if first.type != "simple_identifier":
+        return None
+    segments.append(_read_text(first, source))
+    if all(seg and seg[:1].isupper() for seg in segments):
+        return ".".join(reversed(segments))
     return None
 
 def _swift_receiver_name(recv_node, source: bytes) -> str | None:
