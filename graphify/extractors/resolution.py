@@ -1,7 +1,7 @@
 """resolution — moved verbatim from graphify/extract.py."""
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 from pathlib import Path
 from graphify.extractors.models import LanguageConfig, _JS_CACHE_BYPASS_SUFFIXES, _NamespaceExportFact, _StarExportFact, _SymbolAliasFact, _SymbolDeclarationFact, _SymbolExportFact, _SymbolImportFact, _SymbolResolutionFacts, _SymbolUseFact, _WORKSPACE_PACKAGE_CACHE  # noqa: E402,F401
 from graphify.extractors.base import (  # noqa: F401
@@ -3559,6 +3559,75 @@ def _resolve_cross_file_java_imports(
         walk(tree.root_node)
 
     return new_edges
+
+
+class SwiftTypeIndex(NamedTuple):
+    """Swift module symbol table rebuilt from node attributes (no hand-off)."""
+
+    # qualified path ("PaneLayout.Pane") -> distinct node ids, sorted
+    by_path: dict[str, list[str]]
+    # last path segment ("Pane") -> node ids, one entry per distinct path, so a
+    # node declared under 2+ paths appears 2+ times; sorted
+    by_label: dict[str, list[str]]
+
+
+def _swift_type_index(nodes: list[dict]) -> SwiftTypeIndex:
+    """Index declared Swift types by qualified path and by last segment.
+
+    A node counts only when it is a Swift node stamped with ``_swift_qualified``
+    (the class walk stamps it, so it stands for "declared and contained") and is
+    not an extension-only placeholder.
+    """
+    seen: set[tuple[str, str]] = set()
+    for node in nodes:
+        qualified = node.get("_swift_qualified")
+        nid = node.get("id")
+        if not qualified or not nid or node.get("_swift_extension_only"):
+            continue
+        if not str(node.get("source_file") or "").endswith(".swift"):
+            continue
+        if isinstance(qualified, str):
+            qualified = [qualified]
+        for path in qualified:
+            if path:
+                seen.add((str(path), str(nid)))
+    by_path: dict[str, list[str]] = {}
+    by_label: dict[str, list[str]] = {}
+    for path, nid in sorted(seen):
+        by_path.setdefault(path, []).append(nid)
+        by_label.setdefault(path.rsplit(".", 1)[-1], []).append(nid)
+    for label_nids in by_label.values():
+        label_nids.sort()
+    return SwiftTypeIndex(by_path, by_label)
+
+
+def _swift_lookup(
+    index: SwiftTypeIndex, name: str, scope: str,
+) -> tuple[str, str | None]:
+    """Resolve a written Swift type path against the index, innermost scope first.
+
+    Returns ``("resolved", nid)``, ``("ambiguous", None)``,
+    ``("unresolved", None)`` (the last segment is declared in the corpus but no
+    lexical level matched) or ``("external", None)`` (last segment unknown).
+    """
+    last = name.rsplit(".", 1)[-1] if name else ""
+    label_nids = index.by_label.get(last)
+    if not label_nids:
+        return ("external", None)
+    scope_parts = scope.split(".") if scope else []
+    for depth in range(len(scope_parts), -1, -1):
+        prefix = ".".join(scope_parts[:depth])
+        candidates = index.by_path.get(f"{prefix}.{name}" if prefix else name)
+        if not candidates:
+            continue
+        distinct = sorted(set(candidates))
+        if len(distinct) != 1:
+            return ("ambiguous", None)
+        # by_label holds one entry per path, so repeats mean 2+ declared paths.
+        if label_nids.count(distinct[0]) > 1:
+            return ("ambiguous", None)
+        return ("resolved", distinct[0])
+    return ("unresolved", None)
 
 
 def _go_import_path_for_file(
