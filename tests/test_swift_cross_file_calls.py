@@ -517,6 +517,12 @@ def _xext_foreign_refs(result: dict, nid: str, own_file: str) -> set[tuple[str, 
     return {r for r in _xext_incoming(result, nid) if r[2] != own_file}
 
 
+def _xext_assert_contained(result: dict, ext_file: str, nid: str) -> None:
+    """The file node of `ext_file` must have a `contains` edge to the node `nid`."""
+    file_node = _xext_one(result, ext_file, ext_file)
+    assert _xext_has_edge(result, file_node["id"], nid, "contains"), f"{ext_file} does not contain {nid}"
+
+
 def test_declaration_with_same_file_extension_absorbs_cross_file_extension(tmp_path: Path):
     # RC1: `struct PaneLayout` + `extension PaneLayout` in one file share a node id and
     # the id used to be skipped as a merge candidate, so the `extension PaneLayout` in
@@ -620,6 +626,7 @@ def test_extension_of_outside_type_does_not_absorb_references(tmp_path: Path):
     for label, ext_file in (("String", "StringExt.swift"), ("Date", "DateExt.swift")):
         ext = _xext_one(result, label, ext_file)
         # The extension node stays, file-local, and no other file's reference reaches it.
+        _xext_assert_contained(result, ext_file, ext["id"])
         assert _xext_foreign_refs(result, ext["id"], ext_file) == set(), (
             f"{ext_file} extension of {label} absorbed references from another file"
         )
@@ -640,9 +647,10 @@ def test_extension_of_outside_type_does_not_absorb_references(tmp_path: Path):
 
 
 def test_extension_only_type_extended_in_two_files_stays_unresolved(tmp_path: Path):
-    # `extension View` in two files and `var body: some View` elsewhere: View is declared
-    # nowhere in the corpus. The reference must stay on its stub and neither extension
-    # node may attract it; both survive as extension-only nodes.
+    # Control (passes on the base too: two extension nodes already make the label
+    # ambiguous). `extension View` in two files and `var body: some View` elsewhere: View
+    # is declared nowhere in the corpus. The reference must stay on its stub and neither
+    # extension node may attract it.
     base = tmp_path / "src"
     files = [
         _write(base / "Ext/ViewA.swift",
@@ -658,7 +666,7 @@ def test_extension_only_type_extended_in_two_files_stays_unresolved(tmp_path: Pa
     ext_a = _xext_one(result, "View", "ViewA.swift")
     ext_b = _xext_one(result, "View", "ViewB.swift")
     for ext, own_file in ((ext_a, "ViewA.swift"), (ext_b, "ViewB.swift")):
-        assert ext.get("_swift_extension_only") is True, f"{own_file} extension node lost its marker"
+        _xext_assert_contained(result, own_file, ext["id"])
         assert _xext_foreign_refs(result, ext["id"], own_file) == set()
 
     home_targets = [by_id[e["target"]] for e in result["edges"]
@@ -672,13 +680,42 @@ def test_extension_only_type_extended_in_two_files_stays_unresolved(tmp_path: Pa
     )
 
 
+def test_extension_only_node_does_not_absorb_other_file_reference(tmp_path: Path):
+    # `extension Foo {}` in one file, no declaration anywhere, `var w: Foo` in another
+    # file. On the base the rewire binds the other file's reference to the single
+    # extension node; the extension-only marker keeps it on its sourceless stub.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "FooExt.swift", "extension Foo {\n    func a() {}\n}\n"),
+        _write(base / "Use.swift", "struct Use {\n    var w: Foo\n}\n"),
+    ]
+    result = extract(files, cache_root=tmp_path / "cache", root=base, parallel=False)
+    by_id = {n["id"]: n for n in result["nodes"]}
+
+    ext = _xext_one(result, "Foo", "FooExt.swift")
+    assert ext.get("_swift_extension_only") is True, "the extension node lost its marker"
+    _xext_assert_contained(result, "FooExt.swift", ext["id"])
+    assert _xext_foreign_refs(result, ext["id"], "FooExt.swift") == set(), (
+        "Use.swift reference reached the extension-only node"
+    )
+    targets = [by_id[e["target"]] for e in result["edges"]
+               if e.get("relation") == "references"
+               and e["target"] in by_id and e["source"] in by_id
+               and by_id[e["target"]].get("label") == "Foo"
+               and Path(str(by_id[e["source"]].get("source_file", ""))).name == "Use.swift"]
+    assert targets, "Use.swift lost its reference to Foo"
+    assert all(not t.get("source_file") for t in targets), (
+        f"Use.swift reference to Foo reached {[(t['id'], t.get('source_file')) for t in targets]}"
+    )
+
+
 def test_extension_only_marker_survives_incremental_update(tmp_path: Path):
     """`graphify update` hands the unchanged extension file to the changed file's
     resolution only as context nodes. The extension-only marker must ride along, or
     the changed file's `String` reference binds to the extension again."""
     import json
 
-    from graphify.watch import _rebuild_code
+    from graphify.watch import _GRAPHIFY_OUT, _rebuild_code
 
     corpus = tmp_path / "corpus"
     corpus.mkdir()
@@ -686,7 +723,7 @@ def test_extension_only_marker_survives_incremental_update(tmp_path: Path):
         "extension String {\n    func shout() -> String { self }\n}\n", encoding="utf-8")
     consumer = corpus / "Name.swift"
     consumer.write_text("struct Name {\n    var raw: String\n}\n", encoding="utf-8")
-    graph_path = corpus / "graphify-out" / "graph.json"
+    graph_path = corpus / _GRAPHIFY_OUT / "graph.json"
 
     def graph() -> tuple[dict[str, dict], list[dict]]:
         data = json.loads(graph_path.read_text(encoding="utf-8"))
@@ -705,8 +742,21 @@ def test_extension_only_marker_survives_incremental_update(tmp_path: Path):
             and str(by_id[e["source"]].get("source_file", "")).endswith("Name.swift")
         ]
 
+    def consumer_refs_on_stub() -> int:
+        """Name's field reference to String, kept on a sourceless stub."""
+        by_id, links = graph()
+        return sum(
+            1 for e in links
+            if e.get("relation") == "references" and e.get("context") == "field"
+            and e["source"] in by_id and e["target"] in by_id
+            and by_id[e["source"]].get("label") == "Name"
+            and by_id[e["target"]].get("label") == "String"
+            and not by_id[e["target"]].get("source_file")
+        )
+
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
     assert refs_from_consumer_onto_extension() == [], "the full build bound Name to the String extension"
+    assert consumer_refs_on_stub() == 1, "the full build lost Name's reference to the String stub"
 
     # Change only the consumer; the extension file comes back as context nodes.
     consumer.write_text("struct Name {\n    var raw: String\n    func f() {}\n}\n", encoding="utf-8")
@@ -714,6 +764,7 @@ def test_extension_only_marker_survives_incremental_update(tmp_path: Path):
     by_id, _ = graph()
     assert any(n.get("label") == ".f()" for n in by_id.values()), "the incremental update did not re-extract Name.swift"
     assert refs_from_consumer_onto_extension() == [], "the incremental update bound Name to the String extension"
+    assert consumer_refs_on_stub() == 1, "the incremental update lost Name's reference to the String stub"
 
 
 def test_incremental_extension_merges_into_unchanged_declaration(tmp_path: Path):
@@ -721,7 +772,7 @@ def test_incremental_extension_merges_into_unchanged_declaration(tmp_path: Path)
     candidate, so the extension folds onto it exactly as in a full build."""
     import json
 
-    from graphify.watch import _rebuild_code
+    from graphify.watch import _GRAPHIFY_OUT, _rebuild_code
 
     ext_v1 = "extension Foo {\n    func extra() {}\n}\n"
     ext_v2 = "extension Foo {\n    func extra() {}\n    func more() {}\n}\n"
@@ -735,7 +786,7 @@ def test_incremental_extension_merges_into_unchanged_declaration(tmp_path: Path)
         return ext_file
 
     def graph(corpus: Path) -> tuple[dict[str, dict], set[tuple[str, str, str]]]:
-        data = json.loads((corpus / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+        data = json.loads((corpus / _GRAPHIFY_OUT / "graph.json").read_text(encoding="utf-8"))
         by_id = {n["id"]: n for n in data["nodes"]}
         return by_id, {(e["source"], e["target"], e["relation"]) for e in data["links"]}
 
@@ -810,7 +861,7 @@ def test_same_file_reference_to_extension_only_node_stays_file_local(tmp_path: P
     # Control: `extension Foo {}` and `var v: Foo` in one file, no declaration anywhere.
     # The reference targets that file's own extension node, never a fabricated stub. (The
     # other half of the rule, that no OTHER file's reference reaches an extension-only
-    # node, is covered by test_extension_of_outside_type_does_not_absorb_references.)
+    # node, is covered by test_extension_only_node_does_not_absorb_other_file_reference.)
     base = tmp_path / "src"
     f = _write(base / "Holder.swift", (
         "extension Foo {\n    func a() {}\n}\n\n"
@@ -820,4 +871,5 @@ def test_same_file_reference_to_extension_only_node_stays_file_local(tmp_path: P
 
     foo = _xext_one(result, "Foo", "Holder.swift")
     assert len(_xext_nodes(result, "Foo")) == 1, "a Foo stub appeared next to the file's own node"
+    _xext_assert_contained(result, "Holder.swift", foo["id"])
     assert ("Holder", "field", "Holder.swift") in _xext_incoming(result, foo["id"])
