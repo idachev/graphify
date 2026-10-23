@@ -3712,6 +3712,79 @@ def _resolve_go_type_references(
     ]
 
 
+_SWIFT_TYPE_REFERENCE_RELATIONS = frozenset({"references", "inherits", "implements"})
+
+
+def _resolve_swift_type_references(
+    per_file: list[dict],
+    paths: list[Path],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+    root: Path,
+    resolution_context_nodes: list[dict] | None = None,
+    resolution_context_edges: list[dict] | None = None,
+) -> None:
+    """Bind Swift type references to the declaration Swift name lookup selects.
+
+    The corpus is one module: the index holds every contained Swift type
+    declaration from ``all_nodes`` plus the context nodes. A Swift
+    ``references`` / ``inherits`` / ``implements`` edge onto a sourceless stub is
+    looked up by the stub label (the written, possibly dotted name) in the
+    edge's ``_swift_scope``. ``"resolved"`` repoints the edge and keeps its
+    confidence; ``"ambiguous"`` / ``"unresolved"`` leave it on the stub and stamp
+    ``_swift_lookup`` so the generic rewire does not bind it by bare label;
+    ``"external"`` leaves the edge alone. Repointed stubs nothing references
+    any more are dropped, as in ``_resolve_go_type_references``.
+
+    ``per_file``, ``paths``, ``root`` and ``resolution_context_edges`` keep the
+    shared corpus-pass signature; the lookup reads node attributes only.
+    """
+    index = _swift_type_index(all_nodes + (resolution_context_nodes or []))
+    if not index.by_label:
+        return
+
+    swift_source_ids = {
+        node.get("id") for node in all_nodes + (resolution_context_nodes or [])
+        if node.get("id")
+        and str(node.get("source_file") or "").lower().endswith(".swift")
+    }
+    stub_labels = {
+        node["id"]: str(node.get("label") or "")
+        for node in all_nodes
+        if node.get("id") and not node.get("source_file")
+        and str(node.get("label") or "")
+    }
+    if not swift_source_ids or not stub_labels:
+        return
+
+    repointed_from: set[str] = set()
+    for edge in all_edges:
+        if edge.get("relation") not in _SWIFT_TYPE_REFERENCE_RELATIONS:
+            continue
+        if edge.get("source") not in swift_source_ids:
+            continue
+        target = edge.get("target")
+        label = stub_labels.get(target)
+        if not label:
+            continue
+        status, nid = _swift_lookup(index, label, str(edge.get("_swift_scope") or ""))
+        if status == "resolved" and nid:
+            if nid != target:
+                edge["target"] = nid
+                repointed_from.add(str(target))
+        elif status in {"ambiguous", "unresolved"}:
+            edge["_swift_lookup"] = status
+
+    if not repointed_from:
+        return
+    referenced = {endpoint for edge in all_edges
+                  for endpoint in (edge.get("source"), edge.get("target"))}
+    all_nodes[:] = [
+        node for node in all_nodes
+        if node.get("id") not in repointed_from or node.get("id") in referenced
+    ]
+
+
 def _resolve_java_type_references(
     per_file: list[dict],
     paths: list[Path],
