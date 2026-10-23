@@ -9581,13 +9581,26 @@ def _extract_generic(
                     # Swift `State()` naming a nested or same-file-duplicated
                     # type: defer to extract()'s lexical lookup (АР24). A hit on
                     # the caller's own method is not a bare-label binding and stays.
+                    # Inside a type, a nested type of that name hides a same-named
+                    # free function, and the bare-label map holds whichever was
+                    # declared last, so a free-function fallback defers too; a
+                    # file-scope caller keeps the free function.
                     if (
                         config.ts_module == "tree_sitter_swift"
                         and not is_member_call
-                        and tgt_nid in swift_type_nids
+                        and tgt_nid
                         and callee_name in swift_scoped_ctor_labels
                     ):
-                        tgt_nid = None
+                        _swift_owner_scope: str | None = caller_nid
+                        while _swift_owner_scope and _swift_owner_scope not in method_owner:
+                            _swift_owner_scope = scope_parents.get(_swift_owner_scope)
+                        _swift_in_type = bool(_swift_owner_scope) or caller_nid in swift_type_nids
+                        if tgt_nid in swift_type_nids or (
+                            _swift_in_type
+                            and tgt_nid not in method_owner
+                            and tgt_nid == label_to_nid.get(callee_name)
+                        ):
+                            tgt_nid = None
                 # A name-only reference can leave a source-less stub behind when
                 # the target is outside the scanned corpus (for example,
                 # ``HTTPException`` imported from FastAPI). It is useful for the

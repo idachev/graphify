@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from graphify.extract import extract
 
 
@@ -93,3 +95,47 @@ def test_same_file_top_level_constructor_stays_extracted(tmp_path: Path):
     assert edge["target"] == _node_id(result, "Foo")
     assert edge["confidence"] == "EXTRACTED"
     assert edge.get("context") == "call"
+
+
+_NESTED_STATE = (
+    "struct A {\n"
+    "    struct State {}\n"
+    "    func runA() {\n"
+    "        State()\n"
+    "    }\n"
+    "}\n"
+)
+_FREE_STATE = "func State() {}\n"
+_FILE_SCOPE_CALLER = "func make() {\n    State()\n}\n"
+
+
+
+@pytest.mark.parametrize("free_first", [False, True], ids=["type_first", "function_first"])
+def test_nested_constructor_hides_same_named_free_function(tmp_path: Path, free_first: bool):
+    # ЗД16 r1 F1: inside `A`, the nested `A.State` hides a top-level
+    # `func State()`, whichever is declared last in the file; a file-scope
+    # caller still calls the free function.
+    parts = [_FREE_STATE, _NESTED_STATE] if free_first else [_NESTED_STATE, _FREE_STATE]
+    src = _write(tmp_path / "src/Mixed.swift", "\n".join(parts + [_FILE_SCOPE_CALLER]))
+    result = extract([src], cache_root=tmp_path / "cache")
+
+    type_nid = _node_id(result, "State")
+    func_nid = _node_id(result, "State()")
+
+    run_a_calls = _calls_from(result, _node_id(result, ".runA()"))
+    assert len(run_a_calls) == 1, run_a_calls
+    assert run_a_calls[0]["target"] == type_nid
+    assert run_a_calls[0]["confidence"] == "INFERRED"
+    assert run_a_calls[0].get("context") == "constructor"
+
+    # A file-scope caller never binds to the nested type. When the free
+    # function is declared last it is the bare-label hit and keeps its
+    # EXTRACTED edge; declared first, the bare-label map holds the type, the
+    # call is deferred and the lexical lookup finds no file-scope `State`
+    # type: no edge rather than a wrong one.
+    make_calls = _calls_from(result, _node_id(result, "make()"))
+    assert all(e["target"] != type_nid for e in make_calls), make_calls
+    if not free_first:
+        assert len(make_calls) == 1, make_calls
+        assert make_calls[0]["target"] == func_nid
+        assert make_calls[0]["confidence"] == "EXTRACTED"
