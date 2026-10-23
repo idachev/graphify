@@ -4585,10 +4585,14 @@ def _resolve_swift_member_calls(
     Must run after id-disambiguation so node ids and caller_nids are final.
     """
     type_table_by_file: dict[str, dict[str, str]] = {}
+    # receiver name -> qualified path of the enclosing Swift type, per file (АР3/АР12);
+    # the scope a written type name is looked up from. Omitted at file scope.
+    scopes_by_file: dict[str, dict[str, str]] = {}
     for result in per_file:
         tt = result.get("swift_type_table")
         if tt and tt.get("path"):
             type_table_by_file[tt["path"]] = tt.get("table", {})
+            scopes_by_file[tt["path"]] = tt.get("scopes", {})
     if not type_table_by_file:
         return
 
@@ -4612,6 +4616,7 @@ def _resolve_swift_member_calls(
 
     # (type_node_id, method_key) -> method_node_id, from `method` edges.
     method_index: dict[tuple[str, str], str] = {}
+    method_owner: dict[str, str] = {}  # method nid -> owning type nid
     for e in all_edges:
         if e.get("relation") != "method":
             continue
@@ -4619,6 +4624,7 @@ def _resolve_swift_member_calls(
         tnode = node_by_id.get(tgt)
         if tnode is not None:
             method_index[(src, _key(tnode.get("label", "")))] = tgt
+            method_owner[tgt] = src
 
     # #2561: pending factory bindings (`let x = Factory.make()`) are label-only —
     # resolve each against the factory method's marked plain return type
@@ -4628,6 +4634,10 @@ def _resolve_swift_member_calls(
     # exactly-one guarded; any failure leaves the receiver untyped (no edge,
     # never a wrong one). setdefault: an explicit annotation wins.
     factory_by_file: dict[str, dict] = {}
+    # (file, receiver) -> the factory's resolved return type nid: the label folded
+    # into the table below is a bare node label, not a path written at the
+    # receiver's scope, so such a receiver binds to this nid without a lookup.
+    factory_typed: dict[tuple[str, str], str] = {}
     for result in per_file:
         tt = result.get("swift_type_table")
         if tt and tt.get("path") and tt.get("factory"):
@@ -4662,13 +4672,18 @@ def _resolve_swift_member_calls(
                 targets = return_targets_by_method.get(method_nid, set())
                 if len(targets) != 1:
                     continue
-                tnode = node_by_id.get(next(iter(targets)))
+                ret_nid = next(iter(targets))
+                tnode = node_by_id.get(ret_nid)
                 ret_label = str(tnode.get("label", "")) if tnode else ""
                 if not ret_label or ret_label in _LANGUAGE_BUILTIN_GLOBALS:
                     continue
                 if len(type_def_nids.get(_key(ret_label), [])) != 1:
                     continue
-                table.setdefault(receiver, ret_label)
+                if receiver not in table:
+                    table[receiver] = ret_label
+                    factory_typed[(path, receiver)] = ret_nid
+
+    swift_index = _swift_type_index(all_nodes)
 
     all_raw_calls: list[dict] = []
     for result in per_file:
@@ -4686,12 +4701,23 @@ def _resolve_swift_member_calls(
         # Determine the receiver's type. An upper-cased receiver is itself a type
         # (Type.staticMethod(), Singleton.shared.x()); otherwise look it up in the
         # declaring file's local type table.
+        call_file = rc.get("source_file", "")
+        is_swift_call = str(call_file).lower().endswith(".swift")
+        type_scope: str | None = ""
+        factory_nid = None
         if receiver[:1].isupper():
             type_name = receiver
             type_qualified = True
+            # A bare type name written in a caller is looked up from the
+            # caller's enclosing type (АР20); None = no single scope, bind nothing.
+            if is_swift_call:
+                type_scope = _swift_caller_scope(caller, method_owner, node_by_id)
         else:
-            type_name = type_table_by_file.get(rc.get("source_file", ""), {}).get(receiver)
+            type_name = type_table_by_file.get(call_file, {}).get(receiver)
             type_qualified = False
+            factory_nid = factory_typed.get((call_file, receiver))
+            if factory_nid is None:
+                type_scope = scopes_by_file.get(call_file, {}).get(receiver, "")
         if not type_name:
             continue
         # A builtin receiver type (Data, NSLock, DispatchQueue, ...) must not
@@ -4700,7 +4726,31 @@ def _resolve_swift_member_calls(
         # do the same for Swift (#2147).
         if type_name in _LANGUAGE_BUILTIN_GLOBALS:
             continue
-        type_defs = type_def_nids.get(_key(type_name), [])
+        # The written (possibly dotted) type name is looked up from the receiver's
+        # scope in the Swift type index. Only "external" (the last segment is
+        # unknown to the index) falls back to the label-key path below (АР19);
+        # "ambiguous" / "unresolved" bind nothing and park like any member call
+        # whose type cannot be bound. This replaces the `_key` strip that turned
+        # `Outer.Inner` into `outerinner`.
+        # Calls from other languages share `all_raw_calls`; they keep the label-key
+        # path, which still counts same-named definitions of every language.
+        if factory_nid is not None:
+            lookup_status, lookup_nid = "resolved", factory_nid
+        elif not is_swift_call:
+            lookup_status, lookup_nid = "external", None
+        elif type_scope is None:
+            lookup_status, lookup_nid = "unresolved", None
+        else:
+            lookup_status, lookup_nid = _swift_lookup(swift_index, type_name, type_scope)
+        if lookup_status == "resolved":
+            type_defs = [lookup_nid]
+        elif lookup_status in ("ambiguous", "unresolved"):
+            _park_unresolved_member_call(
+                node_by_id.get(caller), callee, type_name, "swift", rc,
+            )
+            continue
+        else:
+            type_defs = type_def_nids.get(_key(type_name), [])
         if not type_defs:
             # Declared nowhere here — in a multi-repo setup that usually means "in
             # a repo this build does not contain", so park it for the merge
