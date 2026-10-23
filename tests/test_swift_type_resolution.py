@@ -23,7 +23,6 @@ from pathlib import Path
 import pytest
 
 from graphify.extract import extract, extract_swift
-from graphify.paths import GRAPHIFY_OUT
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -281,20 +280,32 @@ def test_member_call_through_nested_type_annotation(tmp_path: Path):
     assert go in _targets(result, run, ("calls",))
 
 
-def test_qualified_identity_survives_incremental_update(tmp_path: Path):
+def test_qualified_identity_survives_incremental_update(tmp_path: Path, monkeypatch):
     # Change only a consumer of `Outer.Inner`. The declaration arrives as resolution
     # context, so the identity (`_swift_qualified`) has to ride through the context-node
     # marker tuples. A second `Inner` under `Other` rules out a label-only fallback.
     from graphify.watch import _rebuild_code
 
+    # GRAPHIFY_OUT is read once at import and copied into several modules by name, so
+    # patch the copies (as tests/test_hook_guard.py does), not just the environment.
+    monkeypatch.delenv("GRAPHIFY_OUT", raising=False)
+    for target in (
+        "graphify.paths.GRAPHIFY_OUT", "graphify.watch._GRAPHIFY_OUT",
+        "graphify.cache._GRAPHIFY_OUT", "graphify.cli._GRAPHIFY_OUT",
+        "graphify.security.GRAPHIFY_OUT", "graphify.detect.GRAPHIFY_OUT",
+    ):
+        monkeypatch.setattr(target, "graphify-out")
+    for target in (
+        "graphify.paths.GRAPHIFY_OUT_NAME", "graphify.security.GRAPHIFY_OUT_NAME",
+        "graphify.detect.GRAPHIFY_OUT_NAME",
+    ):
+        monkeypatch.setattr(target, "graphify-out")
+
     corpus = tmp_path / "corpus"
     _write(corpus / "Outer.swift", "enum Outer {\n    struct Inner { var a: Int }\n}\n")
     _write(corpus / "Other.swift", "enum Other {\n    struct Inner { var b: Int }\n}\n")
     consumer = _write(corpus / "Consumer.swift", "struct Consumer {\n    var i: Outer.Inner\n}\n")
-    # The output directory is configurable (GRAPHIFY_OUT, read once at import), so take
-    # it from the same constant `_rebuild_code` writes through.
-    out_dir = Path(GRAPHIFY_OUT)
-    graph_path = (out_dir if out_dir.is_absolute() else corpus / out_dir) / "graph.json"
+    graph_path = corpus / "graphify-out" / "graph.json"
 
     def graph() -> dict:
         data = json.loads(graph_path.read_text(encoding="utf-8"))
