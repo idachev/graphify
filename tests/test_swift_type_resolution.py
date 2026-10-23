@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from graphify.extract import extract, extract_swift
+from graphify.paths import GRAPHIFY_OUT
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -207,23 +208,30 @@ def test_extension_of_nested_type_merges(tmp_path: Path):
 
 
 def test_qualified_conformance_and_generic_args_resolve(tmp_path: Path):
-    # A qualified base type and a qualified generic argument reach the nested declarations.
+    # A qualified protocol, a qualified base class and a qualified generic argument
+    # reach the nested declarations, with the relation the base kind dictates:
+    # a struct conforms (`implements`), the first base of a class is `inherits`.
     base = tmp_path / "src"
     files = _pane_layout_files(base) + [
-        _write(base / "Outer.swift", "enum Outer {\n    class Base { func hello() {} }\n}\n"),
+        _write(base / "Outer.swift", (
+            "enum Outer {\n    protocol Proto {}\n    class Base { func hello() {} }\n}\n"
+        )),
+        _write(base / "Conf.swift", "struct Conf: Outer.Proto {}\n"),
         _write(base / "Child.swift", "class Child: Outer.Base {}\n"),
         _write(base / "Holder.swift",
                "struct Holder {\n    var x: [String: PaneLayout.Pane]\n}\n"),
     ]
     result = _extract(files, tmp_path)
 
+    proto = _node(result, "Proto", "Outer.swift", parent="Outer")
+    _assert_declaration(result, proto, "Proto", "Outer.swift", "Outer")
     outer_base = _node(result, "Base", "Outer.swift", parent="Outer")
+    _assert_declaration(result, outer_base, "Base", "Outer.swift", "Outer")
     pane = _node(result, "Pane", "PaneLayout.swift", parent="PaneLayout")
-    child = _node(result, "Child", "Child.swift")
-    holder = _node(result, "Holder", "Holder.swift")
 
-    assert outer_base in _targets(result, child, ("inherits", "implements"))
-    assert pane in _targets(result, holder)
+    assert proto in _targets(result, _node(result, "Conf", "Conf.swift"), ("implements",))
+    assert outer_base in _targets(result, _node(result, "Child", "Child.swift"), ("inherits",))
+    assert pane in _targets(result, _node(result, "Holder", "Holder.swift"))
 
 
 def test_type_table_records_full_path(tmp_path: Path):
@@ -283,7 +291,10 @@ def test_qualified_identity_survives_incremental_update(tmp_path: Path):
     _write(corpus / "Outer.swift", "enum Outer {\n    struct Inner { var a: Int }\n}\n")
     _write(corpus / "Other.swift", "enum Other {\n    struct Inner { var b: Int }\n}\n")
     consumer = _write(corpus / "Consumer.swift", "struct Consumer {\n    var i: Outer.Inner\n}\n")
-    graph_path = corpus / "graphify-out" / "graph.json"
+    # The output directory is configurable (GRAPHIFY_OUT, read once at import), so take
+    # it from the same constant `_rebuild_code` writes through.
+    out_dir = Path(GRAPHIFY_OUT)
+    graph_path = (out_dir if out_dir.is_absolute() else corpus / out_dir) / "graph.json"
 
     def graph() -> dict:
         data = json.loads(graph_path.read_text(encoding="utf-8"))
@@ -318,15 +329,18 @@ def test_type_declarations_resolve_with_absolute_paths(tmp_path: Path, monkeypat
     src = root / "src"
     _write(src / "Cfg/Helpers.swift", "enum A {\n    struct Inner { var a: Int }\n}\n")
     _write(src / "Cfg_Helpers.swift", "enum B {\n    struct Inner { var b: Int }\n}\n")
-    _write(src / "Use.swift", "struct Use {\n    var a: A.Inner\n    var b: B.Inner\n}\n")
-    names = ["Cfg/Helpers.swift", "Cfg_Helpers.swift", "Use.swift"]
+    _write(src / "UseA.swift", "struct UseA {\n    var a: A.Inner\n}\n")
+    _write(src / "UseB.swift", "struct UseB {\n    var b: B.Inner\n}\n")
+    names = ["Cfg/Helpers.swift", "Cfg_Helpers.swift", "UseA.swift", "UseB.swift"]
 
     def check(result: dict) -> tuple[str, str]:
         inner_a = _node(result, "Inner", "Cfg/Helpers.swift", parent="A")
         inner_b = _node(result, "Inner", "Cfg_Helpers.swift", parent="B")
         assert inner_a != inner_b
-        targets = _targets(result, _node(result, "Use", "Use.swift"))
-        assert {inner_a, inner_b} <= targets, f"both qualified references must resolve: {targets}"
+        use_a = _targets(result, _node(result, "UseA", "UseA.swift"))
+        use_b = _targets(result, _node(result, "UseB", "UseB.swift"))
+        assert inner_a in use_a and inner_b not in use_a, f"A.Inner must reach A's Inner: {use_a}"
+        assert inner_b in use_b and inner_a not in use_b, f"B.Inner must reach B's Inner: {use_b}"
         return inner_a, inner_b
 
     absolute = extract([src / n for n in names], cache_root=root / "cache-abs",
@@ -337,6 +351,83 @@ def test_type_declarations_resolve_with_absolute_paths(tmp_path: Path, monkeypat
     relative = extract([Path(n) for n in names], cache_root=root / "cache-rel",
                        root=src, parallel=False)
     assert check(relative) == abs_ids
+
+
+def test_member_call_through_nested_parameter_type(tmp_path: Path):
+    # Inside `A`, a bare `State` parameter means A.State, so `x.go()` binds to the
+    # `go()` that `extension A.State` adds, not to B.State's.
+    base = tmp_path / "src"
+    a_file = _write(base / "A.swift", (
+        "struct A {\n"
+        "    struct State { var n: Int }\n"
+        "    func f(_ x: State) {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    files = [
+        a_file,
+        _write(base / "B.swift", (
+            "struct B {\n    struct State { var m: Int\n        func go() {} }\n}\n"
+        )),
+        _write(base / "AState+Ext.swift", "extension A.State {\n    func go() {}\n}\n"),
+    ]
+    table = extract_swift(a_file)["swift_type_table"]
+    assert table["table"]["x"] == "State"
+    assert table["scopes"]["x"] == "A"
+
+    result = _extract(files, tmp_path)
+    a_state = _node(result, "State", "A.swift", parent="A")
+    b_state = _node(result, "State", "B.swift", parent="B")
+    a_go = _node(result, ".go()", "AState+Ext.swift")
+    b_go = _node(result, ".go()", "B.swift")
+    assert any(e.get("relation") == "method" and e.get("source") == a_state
+               and e.get("target") == a_go for e in result["edges"]), (
+        "go() from the extension is a method of A.State"
+    )
+    assert b_state != a_state
+    called = _targets(result, _node(result, ".f()", "A.swift"), ("calls",))
+    assert a_go in called
+    assert b_go not in called
+
+
+def test_nested_base_class_resolves_lexically_in_extension(tmp_path: Path):
+    # In `extension Outer`, the base `Base` means Outer.Base, not the top-level Base.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "Outer.swift", "enum Outer {\n    class Base {}\n}\n"),
+        _write(base / "Base.swift", "class Base {}\n"),
+        _write(base / "Outer+Ext.swift", "extension Outer {\n    class Derived: Base {}\n}\n"),
+    ]
+    result = _extract(files, tmp_path)
+
+    outer_base = _node(result, "Base", "Outer.swift", parent="Outer")
+    _assert_declaration(result, outer_base, "Base", "Outer.swift", "Outer")
+    top_base = _node(result, "Base", "Base.swift")
+    derived = _node(result, "Derived", "Outer+Ext.swift")
+    bases = _targets(result, derived, ("inherits",))
+    assert outer_base in bases
+    assert top_base not in bases
+
+
+def test_extension_of_external_type_does_not_merge_into_nested_namesake(tmp_path: Path):
+    # The only `Config` is `Outer.Config`. `extension Config` elsewhere extends some
+    # outside type: it stays its own node and its methods do not join Outer.Config.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "Outer.swift", "enum Outer {\n    struct Config { var a: Int }\n}\n"),
+        _write(base / "Config+Ext.swift", "extension Config {\n    func extra() {}\n}\n"),
+    ]
+    result = _extract(files, tmp_path)
+
+    nested = _node(result, "Config", "Outer.swift", parent="Outer")
+    ext = _node(result, "Config", "Config+Ext.swift")
+    extra = _node(result, ".extra()", "Config+Ext.swift")
+    assert ext != nested
+    owners = {e["source"] for e in result["edges"]
+              if e.get("relation") == "method" and e.get("target") == extra}
+    assert nested not in owners, "extra() must not become a method of Outer.Config"
+    assert ext in owners, "extra() stays a method of the extension node"
 
 
 # ── controls ──────────────────────────────────────────────────────────────────
@@ -386,53 +477,68 @@ def test_member_call_dotted_type_does_not_bind_concatenated_label(tmp_path: Path
 def test_same_file_duplicate_nested_names_stay_ambiguous(tmp_path: Path):
     # `A.State` and `B.State` declared in one file, referenced from another. Before the
     # nested-id change of Phase 3 both fold into one node holding two qualified paths,
-    # so a lookup that lands on it declines (nothing binds). With distinct nested ids
-    # each reference reaches its own State. Either way no reference reaches the wrong one.
+    # so nothing may bind to it. With distinct nested ids each reference reaches its own
+    # State. Either way no reference reaches the wrong one.
     base = tmp_path / "src"
     files = [
         _write(base / "Features.swift", (
             "struct A {\n    struct State { var a: Int }\n}\n"
             "struct B {\n    struct State { var b: Int }\n}\n"
         )),
-        _write(base / "Consumer.swift", (
-            "struct Consumer {\n    var a: A.State\n    var b: B.State\n}\n"
-        )),
+        _write(base / "ConsumerA.swift", "struct ConsumerA {\n    var s: A.State\n}\n"),
+        _write(base / "ConsumerB.swift", "struct ConsumerB {\n    var s: B.State\n}\n"),
     ]
     result = _extract(files, tmp_path)
 
     states = [n["id"] for n in result["nodes"]
               if n.get("label") == "State" and _sf(n).endswith("Features.swift")]
-    targets = _targets(result, _node(result, "Consumer", "Consumer.swift"))
+    to_a = _targets(result, _node(result, "ConsumerA", "ConsumerA.swift"))
+    to_b = _targets(result, _node(result, "ConsumerB", "ConsumerB.swift"))
     if len(states) == 1:
-        assert states[0] not in targets, "a folded two-path node must not be bound"
-        assert any(_is_stub(result, t) for t in targets), "the references stay on stubs"
+        assert states[0] not in to_a | to_b, "a folded two-path node must not be bound"
     else:
         a_state = _node(result, "State", "Features.swift", parent="A")
         b_state = _node(result, "State", "Features.swift", parent="B")
-        assert {a_state, b_state} <= targets
+        assert a_state in to_a and b_state not in to_a
+        assert b_state in to_b and a_state not in to_b
 
 
 def test_no_cross_language_binding(tmp_path: Path):
-    # A TypeScript `class Store` in the corpus is never the target of a Swift reference,
-    # bare or qualified. The qualified one still reaches the Swift nested `Outer.Store`.
+    # A TypeScript `class Store` in the corpus is never the target of a bare Swift
+    # reference: the reference stays on its sourceless stub.
     base = tmp_path / "src"
     files = [
         _write(base / "web/Store.ts", "export class Store {\n  save() { return 1; }\n}\n"),
-        _write(base / "ios/Outer.swift", "enum Outer {\n    struct Store { var a: Int }\n}\n"),
-        _write(base / "ios/User.swift", (
-            "struct User {\n    var bare: Store\n    var qualified: Outer.Store\n}\n"
-        )),
+        _write(base / "ios/User.swift", "struct User {\n    var bare: Store\n}\n"),
     ]
     result = _extract(files, tmp_path)
 
     ts_store = _node(result, "Store", "Store.ts")
-    swift_store = _node(result, "Store", "Outer.swift", parent="Outer")
     for e in result["edges"]:
         if str(e.get("source_file") or "").endswith(".swift"):
             assert e.get("target") != ts_store, f"Swift edge {e.get('relation')} bound to the TS Store"
     targets = _targets(result, _node(result, "User", "User.swift"))
     assert ts_store not in targets
-    assert swift_store in targets, "Outer.Store reaches the Swift nested declaration"
+    stubs = [t for t in targets if _by_id(result)[t].get("label") == "Store"]
+    assert stubs and all(_is_stub(result, t) for t in stubs), "the reference stays on its stub"
+
+
+def test_qualified_swift_reference_ignores_foreign_namesake(tmp_path: Path):
+    # With a TS `class Store` and a Swift `Outer.Store`, `Outer.Store` reaches the Swift
+    # nested declaration and never the TypeScript class.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "web/Store.ts", "export class Store {\n  save() { return 1; }\n}\n"),
+        _write(base / "ios/Outer.swift", "enum Outer {\n    struct Store { var a: Int }\n}\n"),
+        _write(base / "ios/User.swift", "struct User {\n    var qualified: Outer.Store\n}\n"),
+    ]
+    result = _extract(files, tmp_path)
+
+    ts_store = _node(result, "Store", "Store.ts")
+    swift_store = _node(result, "Store", "Outer.swift", parent="Outer")
+    targets = _targets(result, _node(result, "User", "User.swift"))
+    assert swift_store in targets
+    assert ts_store not in targets
 
 
 def test_swift_reference_to_non_swift_type_keeps_generic_rewire(tmp_path: Path):
@@ -447,12 +553,15 @@ def test_swift_reference_to_non_swift_type_keeps_generic_rewire(tmp_path: Path):
     ]
     result = _extract(files, tmp_path)
 
-    holder = _node(result, "Holder", "Holder.swift")
-    targets = _targets(result, holder)
-    objc = [t for t in targets
-            if _by_id(result)[t].get("label") == "LegacyThing"
-            and _sf(_by_id(result)[t]).endswith((".h", ".m"))]
-    assert objc, f"the Swift reference must reach the ObjC LegacyThing, got {targets}"
+    # The ObjC declaration: a sourced LegacyThing held by its own file node.
+    declarations = {
+        n["id"] for n in result["nodes"]
+        if n.get("label") == "LegacyThing" and _sf(n).endswith((".h", ".m"))
+        and _parent_labels(result, n["id"]) & {"Legacy.h", "Legacy.m"}
+    }
+    assert declarations, "the ObjC class must be declared and held by its file"
+    targets = _targets(result, _node(result, "Holder", "Holder.swift"))
+    assert targets & declarations, f"the Swift reference must reach the ObjC declaration: {targets}"
     assert not any(_is_stub(result, t) and _by_id(result)[t].get("label") == "LegacyThing"
                    for t in targets), "no stub is left for the resolved reference"
 
