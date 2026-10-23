@@ -4160,11 +4160,13 @@ def _merge_swift_extensions(
 
     tree-sitter-swift reuses `class_declaration` for both `class Foo` and
     `extension Foo`, and node ids carry the file stem, so each file that
-    extends `Foo` produces its own `Foo` node. The match is done by label:
-    when exactly one declaration shares the label, extension-only nodes
-    redirect onto it. Extensions of types outside the corpus (no match) and
-    ambiguous labels (more than one match) are left untouched — picking
-    arbitrarily would invent edges — and keep `_swift_extension_only`.
+    extends `Foo` produces its own `Foo` node. The written path (`Foo`,
+    `Outer.Inner`) is resolved against the Swift type index: a single declared
+    match takes the extension-only node; an ambiguous path or a known name
+    declared under another path leaves it untouched — picking arbitrarily
+    would invent edges — with `_swift_extension_only` kept. Only a name the
+    Swift index does not know falls back to the label match: exactly one
+    native-family declaration sharing the label (the Objective-C case).
 
     A declaration with an extension in its own file shares that extension's
     id (`declared: True` in its record); it is a candidate and is never
@@ -4221,17 +4223,34 @@ def _merge_swift_extensions(
             continue
         label_to_canonical.setdefault(label, []).append(n["id"])
     canonical_ids = {nid for nids in label_to_canonical.values() for nid in nids}
+    # The extended type is looked up by its full written path ("Outer.Inner"
+    # or a bare "Config") in the Swift type index, with no lexical scope: an
+    # extension is always written at file scope. The bare-label table above is
+    # only the fallback for a type the Swift index does not know at all (an
+    # Objective-C declaration); a bare label must never fold onto a unique
+    # nested type that merely shares its last segment.
+    swift_index = _swift_type_index(candidate_nodes)
+    canonical_ids.update(nid for nids in swift_index.by_path.values() for nid in nids)
 
     remap: dict[str, str] = {}
-    for ext_nid in extension_nids:
+    for ext_nid in sorted(extension_nids):
         # Two files with one stem can mint one id for a declaration and an
         # extension; remapping it would drop the declaration with it.
         if ext_nid in declared_nids or ext_nid in canonical_ids:
             continue
-        candidates = label_to_canonical.get(extension_labels[ext_nid], [])
-        if len(candidates) != 1:
+        ext_label = extension_labels[ext_nid]
+        status, resolved_nid = _swift_lookup(swift_index, ext_label, "")
+        if status == "resolved":
+            canonical_nid = resolved_nid
+        elif status != "external":
+            # Ambiguous or not declared at this path: keep the extension node
+            # and its `_swift_extension_only` marker rather than guess.
             continue
-        canonical_nid = candidates[0]
+        else:
+            candidates = label_to_canonical.get(ext_label, [])
+            if len(candidates) != 1:
+                continue
+            canonical_nid = candidates[0]
         if canonical_nid != ext_nid:
             remap[ext_nid] = canonical_nid
 
