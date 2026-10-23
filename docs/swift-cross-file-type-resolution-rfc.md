@@ -448,7 +448,7 @@ Extractor (`engine.py`, class walk around `6257-6290`):
 
 Same-file references to an extension-only node: `ensure_named_node` returns the file's own id
 when the name is in `seen_ids` (`engine.py:6015-6022`). So in a file with `extension Foo {}`
-and `var v: Foo`, the reference targets the file's extension node, not a stub. This is
+and `struct Holder { var v: Foo }`, the reference targets the file's extension node, not a stub. This is
 today's behaviour and Phase 1 keeps it: the edge stays file-local. If the merge folds the
 extension into a declaration, the edge follows it (`extract.py:4219-4240`). The node never
 attracts references from other files (rewire rule below).
@@ -465,6 +465,11 @@ Corpus (`_merge_swift_extensions`, `extract.py:4147`):
   declaration, as in a full build.
 - Remap only extension-only ids. A survivor (no candidate, or several) keeps
   `_swift_extension_only`.
+- The remap also rewrites `raw_calls[].caller_nid` in `per_file` (the same dicts as
+  `all_raw_calls`, `extract.py:9656-9660`), as the prefix remap (`extract.py:9959-9962`) and
+  the symbol remap (`extract.py:10040-10043`) do. A property initializer in an extension is
+  walked with the extension node as its caller (`engine.py:7341`); without the rewrite its
+  raw calls, including the ones deferred to Phase 4 (АР24), keep a deleted caller id.
 
 Rewire (`_rewire_unique_stub_nodes`, `extract.py:3936`):
 
@@ -704,7 +709,8 @@ Phase 1 (`tests/test_swift_cross_file_calls.py`):
   `references` edge onto it.
 - Regression `test_extension_of_outside_type_does_not_absorb_references`: the #4574 repro.
 - Regression `test_extension_only_node_does_not_absorb_other_file_reference`: `extension Foo {}`
-  in one file, no declaration, `var w: Foo` in another file. The other file's reference stays
+  in one file, no declaration, `struct Consumer { var w: Foo }` in another file. The other
+  file's reference stays
   on its stub; on baseline the rewire binds it to the single extension node.
 - Regression `test_extension_only_marker_survives_incremental_update`: `_rebuild_code` with the
   extension file only in the resolution context; no edge from the changed file onto it.
@@ -714,10 +720,10 @@ Phase 1 (`tests/test_swift_cross_file_calls.py`):
 - Control `test_same_file_extension_alone_still_resolves_references`: the RC1 control. It
   guards against the #4600 regression.
 - Control `test_same_file_reference_to_extension_only_node_stays_file_local`: `extension Foo {}`
-  and `var v: Foo` in one file, no declaration, no other consumer. The edge targets that
-  file's node.
+  and `struct Holder { var v: Foo }` in one file, no declaration, no other consumer. The edge
+  targets that file's node.
 - Control `test_extension_only_type_extended_in_two_files_stays_unresolved`: `extension View`
-  in two files, `var body: some View` elsewhere. Asserts no edge onto either extension node;
+  in two files, `struct Screen { var body: some View }` elsewhere. Asserts no edge onto either extension node;
   on baseline the two extension nodes already make the label ambiguous
   (`extract.py:3933-3946`, `extract.py:3993-4012`).
 
@@ -729,8 +735,11 @@ Phase 2 (new `tests/test_swift_type_resolution.py`):
   `extension LayoutFeature { func f(_ s: State) }` in another file reaches
   `LayoutFeature.State` and not another reducer's `State`.
 - Regression `test_bare_name_not_visible_lexically_stays_on_stub`: the only `Config` is
-  `Outer.Config`; a bare `Config` in another file stays on its stub with
-  `_swift_lookup == "unresolved"`.
+  `Outer.Config`; a bare `Config` in another file stays on its stub, and no edge reaches
+  `Outer.Config`. The `_swift_lookup` marker is popped at the end of `extract()` (АР16), so
+  `_swift_lookup == "unresolved"` is asserted in a direct test of
+  `_resolve_swift_type_references` in `tests/test_swift_type_index.py` (АР15),
+  `test_type_pass_marks_bare_name_not_visible_lexically_unresolved`.
 - Regression `test_extension_of_nested_type_merges`: `extension LayoutFeature.State { ... }` in
   another file. Its methods attach to the nested declaration.
 - Regression `test_qualified_conformance_and_generic_args_resolve`: `struct A: Outer.Proto` and
@@ -791,6 +800,10 @@ Phase 4 (`tests/test_swift_cross_file_calls.py`):
   `B.State`, each an INFERRED `calls` edge with `context == "constructor"` (АР24).
 - Control `test_same_file_top_level_constructor_stays_extracted`: a single top-level
   `struct Foo` and `func make() { Foo() }` in one file keep today's EXTRACTED `calls` edge.
+- Control `test_extension_initializer_constructor_call_survives_merge`: `Model.swift` with
+  `struct Outer {}`, `Extras.swift` with `extension Outer { struct Inner {}; static let value =
+  Inner() }`. After the merge a `calls` edge from `Outer` to `Inner` exists and no raw call or
+  edge keeps the deleted extension id (baseline has `Outer -> Inner`).
 
 Phase 5 (`tests/test_swift_import_resolution.py`). `extract()` never calls
 `deduplicate_entities` (its only caller is `build.py:1921`), so these tests call
