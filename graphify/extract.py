@@ -4580,10 +4580,14 @@ def _resolve_swift_member_calls(
     Must run after id-disambiguation so node ids and caller_nids are final.
     """
     type_table_by_file: dict[str, dict[str, str]] = {}
+    # receiver name -> qualified path of the enclosing Swift type, per file (АР3/АР12);
+    # the scope a written type name is looked up from. Omitted at file scope.
+    scopes_by_file: dict[str, dict[str, str]] = {}
     for result in per_file:
         tt = result.get("swift_type_table")
         if tt and tt.get("path"):
             type_table_by_file[tt["path"]] = tt.get("table", {})
+            scopes_by_file[tt["path"]] = tt.get("scopes", {})
     if not type_table_by_file:
         return
 
@@ -4623,6 +4627,10 @@ def _resolve_swift_member_calls(
     # exactly-one guarded; any failure leaves the receiver untyped (no edge,
     # never a wrong one). setdefault: an explicit annotation wins.
     factory_by_file: dict[str, dict] = {}
+    # (file, receiver) pairs typed from a factory return label: that label is a
+    # bare node label, not a path written at the receiver's scope, so it is looked
+    # up from file scope.
+    factory_typed: set[tuple[str, str]] = set()
     for result in per_file:
         tt = result.get("swift_type_table")
         if tt and tt.get("path") and tt.get("factory"):
@@ -4663,7 +4671,11 @@ def _resolve_swift_member_calls(
                     continue
                 if len(type_def_nids.get(_key(ret_label), [])) != 1:
                     continue
-                table.setdefault(receiver, ret_label)
+                if receiver not in table:
+                    table[receiver] = ret_label
+                    factory_typed.add((path, receiver))
+
+    swift_index = _swift_type_index(all_nodes)
 
     all_raw_calls: list[dict] = []
     for result in per_file:
@@ -4681,12 +4693,16 @@ def _resolve_swift_member_calls(
         # Determine the receiver's type. An upper-cased receiver is itself a type
         # (Type.staticMethod(), Singleton.shared.x()); otherwise look it up in the
         # declaring file's local type table.
+        call_file = rc.get("source_file", "")
+        type_scope = ""
         if receiver[:1].isupper():
             type_name = receiver
             type_qualified = True
         else:
-            type_name = type_table_by_file.get(rc.get("source_file", ""), {}).get(receiver)
+            type_name = type_table_by_file.get(call_file, {}).get(receiver)
             type_qualified = False
+            if (call_file, receiver) not in factory_typed:
+                type_scope = scopes_by_file.get(call_file, {}).get(receiver, "")
         if not type_name:
             continue
         # A builtin receiver type (Data, NSLock, DispatchQueue, ...) must not
@@ -4695,7 +4711,23 @@ def _resolve_swift_member_calls(
         # do the same for Swift (#2147).
         if type_name in _LANGUAGE_BUILTIN_GLOBALS:
             continue
-        type_defs = type_def_nids.get(_key(type_name), [])
+        # The written (possibly dotted) type name is looked up from the receiver's
+        # scope in the Swift type index. Only "external" (the last segment is
+        # unknown to the index) falls back to the label-key path below (АР19);
+        # "ambiguous" / "unresolved" bind nothing and park like any member call
+        # whose type cannot be bound. This replaces the `_key` strip that turned
+        # `Outer.Inner` into `outerinner`.
+        lookup_status, lookup_nid = _swift_lookup(swift_index, type_name, type_scope)
+        if lookup_status == "resolved":
+            type_defs = [lookup_nid]
+        elif lookup_status in ("ambiguous", "unresolved"):
+            if str(rc.get("source_file", "")).lower().endswith(".swift"):
+                _park_unresolved_member_call(
+                    node_by_id.get(caller), callee, type_name, "swift", rc,
+                )
+            continue
+        else:
+            type_defs = type_def_nids.get(_key(type_name), [])
         if not type_defs:
             # Declared nowhere here — in a multi-repo setup that usually means "in
             # a repo this build does not contain", so park it for the merge
