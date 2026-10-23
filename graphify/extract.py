@@ -4239,6 +4239,13 @@ def _merge_swift_extensions(
         return
 
     all_nodes[:] = [n for n in all_nodes if n.get("id") not in remap]
+    # An initializer in the extension (`static let value = VM()`) is walked with
+    # the type node as its caller, so its raw call would keep a deleted caller.
+    # These are the same dicts as extract()'s all_raw_calls.
+    for result in per_file:
+        for rc in result.get("raw_calls", []) or []:
+            if rc.get("caller_nid") in remap:
+                rc["caller_nid"] = remap[rc["caller_nid"]]
 
     # Each extension file's `contains` edge ends up pointing at the canonical
     # type — multiple files containing the same node is the intended shape:
