@@ -290,10 +290,15 @@ The phases depend on each other, so they land in this order (decision АР6):
   carry the parent, `ensure_named_node` (`engine.py:6015-6022`) no longer finds `State` in the
   file and mints a stub. Phase 4 uses Phase 2's index.
 - Phase 5 is independent and can land at any time.
+- Upstream, Phase 3 ships in the same PR as Phase 4 (or after it). With parent-based ids,
+  `struct Outer { struct Inner {}; func use(_ x: Inner) {}; func run() { Inner() } }` mints a
+  sourceless `Inner` stub for the parameter (`engine.py:6016-6022`); the same-file label map
+  then sends `Inner()` to raw calls with `via_stub` (`engine.py:9567`, `engine.py:9617-9618`),
+  which only Phase 4 binds (`extract.py:10798`). This branch lands all phases together.
 - Each PR is correct on its own once the PRs before it have landed. Phase 2 without Phase 3
   fails closed on folded same-file nested types (see Phase 2, rule 5).
 
-### Fixed contracts (decisions АР1-АР8)
+### Fixed contracts (decisions АР1-АР22)
 
 Parallel implementers build against these names. A phase may not rename them.
 
@@ -302,14 +307,14 @@ Parallel implementers build against these names. A phase may not rename them.
 | node key | `_swift_extension_only: True` | 1 | sourced Swift class node made only of `extension` blocks in its file |
 | per-file record | `swift_extensions[]` = `{"nid", "label", "declared": bool}` | 1 | `declared` = the id is also in `swift_declared_nids` |
 | node key | `_swift_qualified: list[str]` | 2 | qualified paths of the declaration(s) on this node, e.g. `["LayoutFeature.State"]`; an extension node holds the path it extends |
-| edge attr | `_swift_scope: str` | 2 | on Swift `references` edges: qualified path of the enclosing type or extended type; omitted at file scope |
+| edge attr | `_swift_scope: str` | 2 | on Swift `references`, `inherits` and `implements` edges: qualified path of the enclosing type or extended type; omitted at file scope (АР14) |
 | edge attr | `_swift_lookup: "ambiguous" \| "unresolved"` | 2 | the Swift pass declined this edge; the generic rewire must leave it on its stub |
-| per-file record | `swift_type_table = {"path", "table", "scopes", "factory"?}` | 2 | `table[prop]` is the written type path (`"PaneLayout.Pane"`); new `scopes[prop]` is the property's `_swift_scope` |
+| per-file record | `swift_type_table = {"path", "table", "scopes", "factory"?}` | 2 | `table[name]` is the written type path (`"PaneLayout.Pane"`) for properties, parameters and locals alike; new `scopes[name]` is the innermost enclosing Swift type (АР12) |
 | function | `_swift_type_index(nodes: list[dict]) -> SwiftTypeIndex` | 2 | `extractors/resolution.py`; `SwiftTypeIndex` is a `NamedTuple(by_path: dict[str, list[str]], by_label: dict[str, list[str]])` |
 | function | `_swift_lookup(index: SwiftTypeIndex, name: str, scope: str) -> tuple[str, str \| None]` | 2 | status `"resolved"` (with nid), `"ambiguous"`, `"unresolved"` or `"external"` (with `None`) |
 | function | `_resolve_swift_type_references(per_file, paths, all_nodes, all_edges, root, resolution_context_nodes=None, resolution_context_edges=None) -> None` | 2 | `extractors/resolution.py`, same signature as `_resolve_go_type_references` (`resolution.py:3612-3620`) |
 | function | `_merge_swift_extensions(per_file, all_nodes, all_edges, context_nodes=None, context_edges=None) -> None` | 1 | `extract.py:4147`; context arguments are read-only candidates |
-| function | `_swift_caller_scope(caller_nid: str, method_owner: dict[str, str], node_by_id: dict[str, dict]) -> str \| None` | 4 | `extract.py`; `""` for a file-scope function, `None` when the owner has 0 or 2+ qualified paths |
+| function | `_swift_caller_scope(caller_nid: str, method_owner: dict[str, str], node_by_id: dict[str, dict]) -> str \| None` | 4 | `extract.py`; a caller that is itself a Swift type uses its own path, else the `method`/`contains` owner's path; `""` for a file-scope function, `None` when the type has 0 or 2+ qualified paths (АР20) |
 | cache | `_AST_CACHE_SCHEMA` (`cache.py:40`) | 1, 2, 3 | one bump per PR that changes per-file output (АР5) |
 
 Decisions, each with its reason and the rejected alternative:
@@ -370,6 +375,51 @@ Decisions, each with its reason and the rejected alternative:
   If #4599 lands first with the same formula, Phase 3 shrinks to the pre-scan and the tests.
   *Reason:* #4599 is outside this repository and was not re-checked in review. The formula has
   a local precedent. *Rejected:* blocking Phase 3 on #4599; adopting its diff unseen.
+
+Decisions АР9-АР22 close the remaining gaps between the phases:
+
+- **АР9** The presence of `_swift_qualified` on a node stands for "declared and contained";
+  only the Swift class walk stamps it, and every class-walk node gets a `contains` edge
+  (`engine.py:6278-6281`). `_swift_type_index(nodes)` takes no edges.
+- **АР10** Candidates are counted by distinct nid. A node whose `_swift_qualified` has 2+
+  distinct paths gives `"ambiguous"` whenever a lookup hits it.
+- **АР11** `_swift_qualified` is deduplicated and keeps its order: a same-file `struct X` +
+  `extension X` gives `["X"]`, not `["X", "X"]`.
+- **АР12** Every `swift_type_table["table"]` value is the written path (dotted when written
+  dotted), whatever helper produced it: `_swift_collect_type_refs`, `_swift_constructor_type`,
+  attribute type, navigation head, parameters (`engine.py:7898-7899`) or `_swift_local_var_types`
+  (`engine.py:2984`). `scopes[name]` is the qualified path of the innermost enclosing Swift
+  type (for a parameter or a function local: the enclosing type of the function); omitted at
+  file scope.
+- **АР13** `_swift_classify_base` classifies a dotted base on its last segment.
+- **АР14** `_swift_scope` is also stamped on Swift `inherits` / `implements` edges
+  (`engine.py:6333-6339`); the Phase 2 pass processes `references`, `inherits` and
+  `implements`.
+- **АР15** Unit tests for `_swift_type_index` / `_swift_lookup` go to the new file
+  `tests/test_swift_type_index.py`.
+- **АР16** `_swift_scope` and `_swift_lookup` are run-local: popped from every edge at the end
+  of `extract()`, next to the existing `_rust_use_name` pop (`extract.py:10896`), after every
+  resolver and the rewire.
+- **АР17** The Phase 2 pass considers only Swift edges (source node from a `.swift` file) of
+  those relations whose target is a sourceless stub, and reads the written name from the stub
+  `label`. Edges onto a sourced node are left alone.
+- **АР18** In `_merge_swift_extensions`, from Phase 2 on, **every** extension label, dotted or
+  bare, resolves through `_swift_lookup(index, label, "")` (absolute path, no scope):
+  `"resolved"` merges into that nid; `"ambiguous"` / `"unresolved"` do not merge (the
+  extension node stays, with its marker); only `"external"` falls back to the existing
+  family-gated bare-label path (Objective-C ↔ Swift). *Reason:* a bare `extension Config` of an
+  outside type must not merge into a unique nested `Outer.Config`, whose label is also
+  `Config` (`extract.py:4178-4211`). Phase 1 keeps the bare-label path; Phase 2 replaces it.
+- **АР19** In `_resolve_swift_member_calls`, only status `"external"` falls back to today's
+  `_key(label)` path. `"resolved"` binds to that nid; `"ambiguous"` / `"unresolved"` bind
+  nothing and are parked as today's unresolved member calls.
+- **АР20** `_swift_caller_scope`: a caller that is itself a Swift type node with exactly one
+  `_swift_qualified` path uses that path (a property initializer is walked with the type as
+  its caller, `engine.py:7341`); a caller found through `method` / `contains` uses its owner's
+  single path; 2+ paths -> `None` (no binding); a file-scope function -> `""`.
+- **АР21** Resolved type edges keep `EXTRACTED` (Phase 2, rule 2).
+- **АР22** Each phase adds its own import line in `extract.py` next to the existing resolution
+  imports; no placeholder stubs.
 
 ### Phase 1: mark real declarations (RC1, RC2)
 
@@ -443,10 +493,13 @@ Extractor outputs. They change per-file records, so `_AST_CACHE_SCHEMA` gets a b
   emit nothing. `_swift_user_type_name` (`engine.py:1424-1432`) returns the same joined path
   for inheritance clauses.
 - The stub for `PaneLayout.Pane` is labelled `PaneLayout.Pane`, not `PaneLayout`. Every Swift
-  `references` edge carries `_swift_scope`, the qualified path of the enclosing type or
-  extended type (`"LayoutFeature.State"`), omitted at file scope.
-- `swift_type_table["table"][prop]` holds the joined path (`prop_type` at `engine.py:7333` takes
-  it), and a new `swift_type_table["scopes"][prop]` holds the property's scope.
+  `references`, `inherits` and `implements` edge carries `_swift_scope`, the qualified path of
+  the enclosing type or extended type (`"LayoutFeature.State"`), omitted at file scope (АР14).
+- `swift_type_table["table"][name]` holds the joined path for every producer: properties
+  (`prop_type` at `engine.py:7333`), parameters (`engine.py:7898-7899`) and locals
+  (`_swift_local_var_types`, `engine.py:2984`). A new `swift_type_table["scopes"][name]` holds
+  the innermost enclosing Swift type; for a parameter or a local, the enclosing type of the
+  function (АР12).
 
 Symbol table (`_swift_type_index`, АР1):
 
@@ -455,8 +508,8 @@ by_path:  qualified name ("PaneLayout", "PaneLayout.Pane", "LayoutFeature.State"
 by_label: last segment ("Pane", "State") -> [nid, ...]
 ```
 
-It holds nodes whose `source_file` is `.swift`, that are contained, carry `_swift_qualified`
-and are not `_swift_extension_only`, from
+It holds nodes whose `source_file` is `.swift`, that carry `_swift_qualified` (which stands
+for declared and contained, АР9) and are not `_swift_extension_only`, from
 `all_nodes` plus the context nodes. In the first version the table covers the **whole corpus**:
 the corpus is treated as one module. This is the same boundary the generic rewire uses today.
 A unique declaration in another SwiftPM or Xcode target can therefore bind; per-target scoping
@@ -480,15 +533,20 @@ arguments and extension targets:
    Foundation, a package outside the corpus, or an Objective-C class). The edge is left
    untouched, and the generic rewire handles it as today.
 
-For `"ambiguous"` and `"unresolved"` the edge stays on its stub and gets `_swift_lookup` set to
-the status. `_rewire_unique_stub_nodes` leaves such an edge on its stub (АР7).
+The pass handles only Swift `references`, `inherits` and `implements` edges whose target is a
+sourceless stub; the written name is the stub `label` (АР14, АР17). For `"ambiguous"` and
+`"unresolved"` the edge stays on its stub and gets `_swift_lookup` set to the status.
+`_rewire_unique_stub_nodes` leaves such an edge on its stub (АР7).
 
-Extensions of nested types resolve with the same lookup, so `extension LayoutFeature.State`
-merges into the nested declaration. For dotted labels this replaces the bare-label match in
-`_merge_swift_extensions`.
+Extension targets resolve with the same lookup at file scope (АР18): every extension label,
+dotted or bare, goes through `_swift_lookup(index, label, "")` in `_merge_swift_extensions`.
+`extension LayoutFeature.State` merges into the nested declaration; a bare `extension Config` of
+an outside type does not merge into a nested `Outer.Config` (`"unresolved"`). Only
+`"external"` falls back to the existing family-gated bare-label match, which keeps Swift↔ObjC
+folding.
 
-Member calls (АР3): `_resolve_swift_member_calls` resolves `table[prop]` through
-`_swift_lookup` with `scopes[prop]`.
+Member calls (АР3, АР19): `_resolve_swift_member_calls` resolves `table[name]` through
+`_swift_lookup` with `scopes[name]`.
 
 Edges that the pass repoints leave their stubs unreferenced. Those stubs are dropped in the
 same way as in `_resolve_go_type_references` (`resolution.py:3705-3712`). Stubs that are still
@@ -504,9 +562,10 @@ referenced stay as they are today.
   (`engine.py:5975-5977`). A new `_swift_nested_collision_groups(body_node, source: bytes,
   parent_nid: str) -> dict[str, set[str]]` collects, per parent, the nested type and member
   names that slug to one id. Both the type id and the member id go through
-  `_underscore_salted_nid(plain_nid, name, groups)` (`engine.py:1311`), which salts every
-  colliding name by a hash of the name, independent of declaration order. Ids without a
-  collision are unchanged.
+  `_underscore_salted_nid(plain_nid, name, groups)` (`engine.py:1311`), which salts the
+  colliding names by a hash of the name, independent of declaration order; a single public
+  name (no leading `_`) in the group keeps the plain id (`engine.py:1331-1333`), as for Python
+  #2810. Ids without a collision are unchanged.
 - A bare in-body reference (`func f(_ s: State)`) now misses the same-file shortcut and resolves
   through Phase 2's lexical lookup.
 - Bump `_AST_CACHE_SCHEMA` (АР5).
@@ -517,10 +576,12 @@ In the shared call pass in `extract()`, for every Swift raw call that is not `is
 (member calls are skipped earlier, at `extract.py:10517`), run the Swift lookup **before** the
 generic candidate filtering:
 
-- scope = `_swift_caller_scope(caller_nid, method_owner, node_by_id)`: the single
-  `_swift_qualified` path of the type that owns the caller through a `method` edge (the
-  `_csharp_method_owner` pattern, `extract.py:10573-10577`), `""` for a file-scope function.
-  `None` (owner with 0 or 2+ paths) means no Swift binding for this call.
+- scope = `_swift_caller_scope(caller_nid, method_owner, node_by_id)` (АР20): a caller that is
+  itself a Swift type with one `_swift_qualified` path uses that path (property initializers
+  are walked with the type as caller, `engine.py:7341`); otherwise the single path of the type
+  that owns the caller through a `method` / `contains` edge (the `_csharp_method_owner`
+  pattern, `extract.py:10573-10577`); `""` for a file-scope function. `None` (0 or 2+ paths)
+  means no Swift binding for this call.
 - `_swift_lookup(_swift_type_index(resolution_nodes), callee, scope)`:
   - `"resolved"`: emit `calls` with `context="constructor"`, `confidence="INFERRED"`,
     `confidence_score=0.85`, then `continue`. The call is inferred and not extracted, because
@@ -625,8 +686,9 @@ Phase 1 (`tests/test_swift_cross_file_calls.py`):
   file repro. It asserts one `PaneLayout` node, `.migrated()` as its method, and every
   `references` edge onto it.
 - Regression `test_extension_of_outside_type_does_not_absorb_references`: the #4574 repro.
-- Regression `test_extension_only_type_extended_in_two_files_stays_unresolved`: `extension View`
-  in two files, `var body: some View` elsewhere. Asserts no edge onto either extension node.
+- Regression `test_extension_only_node_does_not_absorb_other_file_reference`: `extension Foo {}`
+  in one file, no declaration, `var w: Foo` in another file. The other file's reference stays
+  on its stub; on baseline the rewire binds it to the single extension node.
 - Regression `test_extension_only_marker_survives_incremental_update`: `_rebuild_code` with the
   extension file only in the resolution context; no edge from the changed file onto it.
 - Regression `test_incremental_extension_merges_into_unchanged_declaration`: full build, then
@@ -635,8 +697,12 @@ Phase 1 (`tests/test_swift_cross_file_calls.py`):
 - Control `test_same_file_extension_alone_still_resolves_references`: the RC1 control. It
   guards against the #4600 regression.
 - Control `test_same_file_reference_to_extension_only_node_stays_file_local`: `extension Foo {}`
-  and `var v: Foo` in one file, no declaration. The edge targets that file's node; no other
-  file's reference reaches it.
+  and `var v: Foo` in one file, no declaration, no other consumer. The edge targets that
+  file's node.
+- Control `test_extension_only_type_extended_in_two_files_stays_unresolved`: `extension View`
+  in two files, `var body: some View` elsewhere. Asserts no edge onto either extension node;
+  on baseline the two extension nodes already make the label ambiguous
+  (`extract.py:3933-3946`, `extract.py:3993-4012`).
 
 Phase 2 (new `tests/test_swift_type_resolution.py`):
 
@@ -657,6 +723,15 @@ Phase 2 (new `tests/test_swift_type_resolution.py`):
   `result["swift_type_table"]["scopes"]["focused"] == "LayoutFeature.State"`.
 - Regression `test_member_call_through_nested_type_annotation`: `x: Outer.Inner` and `x.go()`
   bind to `Inner.go()`.
+- Regression `test_member_call_through_nested_parameter_type`: `A.State` and `B.State`;
+  inside `A`, `func f(_ x: State) { x.go() }`, with `go()` in `extension A.State` in another
+  file; `scopes["x"] == "A"` and the call binds to `A.State.go()`.
+- Regression `test_nested_base_class_resolves_lexically_in_extension`: `Outer.Base`, a
+  top-level `Base`, and `extension Outer { class Derived: Base {} }` in another file; the
+  `inherits` edge reaches `Outer.Base`.
+- Regression `test_extension_of_external_type_does_not_merge_into_nested_namesake`: the only
+  `Config` is `Outer.Config`; `extension Config { func extra() {} }` in another file stays its
+  own node, and `extra()` is not a method of `Outer.Config`.
 - Regression `test_qualified_identity_survives_incremental_update`: change only a consumer of
   `Outer.Inner`; it still reaches `Inner` from the context.
 - Regression `test_type_declarations_resolve_with_absolute_paths`: the same fixture extracted
@@ -682,6 +757,9 @@ Phase 3 (`tests/test_swift_type_resolution.py`):
   func state() {} }` keeps both nodes and their `contains` / `method` edges.
 - Regression `test_bare_in_body_reference_binds_own_nested_type`: two features with their own
   `State` in one file; each `func f(_ s: State)` binds to its own `State`.
+- Control `test_nested_constructor_call_kept_after_nested_ids` (needs Phase 4 in the same PR):
+  `struct Outer { struct Inner {}; func use(_ x: Inner) {}; func run() { Inner() } }` keeps a
+  `calls` edge from `run()` to `Inner`, as on baseline.
 
 Phase 4 (`tests/test_swift_cross_file_calls.py`):
 
@@ -709,6 +787,10 @@ Full gate, per CONTRIBUTING: `uv run pytest tests -q`, `uv run ruff check .`, `u
 - tree-sitter-swift parse errors that swallow declarations (the `@Reducer` struct above, #3542).
 - Member-call resolution through nested receivers (`state.layout.encodeAll()`, depth > 1).
 - Constructor calls in member form (`Outer.Inner(...)`), see Phase 4.
+- Member calls through a factory that returns a nested type whose bare name is not unique
+  (`let x = Factory.make(); x.go()` with `make() -> Outer.Inner` and a top-level `Inner`). The
+  factory path checks bare-label uniqueness (`extract.py:4661-4666`), so it binds nothing
+  (fail-closed).
 - Re-resolving references in unchanged files on an incremental build (see Impact).
 - Cross-module resolution with `@testable import` evidence (see Q1).
 - Protocol-extension default implementations and conditional conformances
