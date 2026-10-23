@@ -4186,10 +4186,10 @@ def _merge_swift_extensions(
     if not extension_nids:
         return
 
-    fresh_ids = {n.get("id") for n in all_nodes}
-    candidate_nodes = all_nodes + [
-        n for n in context_nodes or [] if n.get("id") not in fresh_ids
-    ]
+    # Context holds unchanged files only, so a context node that shares an id
+    # with a fresh one is a distinct declaration (a stem collision) and must
+    # count, both for the guard below and for ambiguity, as in a full build.
+    candidate_nodes = all_nodes + list(context_nodes or [])
     # A genuine Swift type is the target of a `contains` edge from its file node;
     # bare-reference shadow nodes (`let x: Foo`) carry a source_file but are NOT
     # contained, so excluding them keeps a stub from making a real type look
@@ -4245,8 +4245,13 @@ def _merge_swift_extensions(
     # the type owns the methods, the files own their slice. Self-loops are
     # dropped (e.g. an in-file extension method whose call already pointed at
     # the canonical type).
+    # `context` is in the key: `func run(_ x: Foo) -> Foo` emits a
+    # `parameter_type` and a `return_type` reference on one line.
     def _key_of(e: dict, src: str, tgt: str) -> tuple:
-        return (src, tgt, e.get("relation"), e.get("source_file"), e.get("source_location"))
+        return (
+            src, tgt, e.get("relation"), e.get("source_file"),
+            e.get("source_location"), e.get("context"),
+        )
 
     rewritten: list[dict] = []
     seen_keys: set[tuple] = set()
