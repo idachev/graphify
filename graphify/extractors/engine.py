@@ -1430,8 +1430,9 @@ def _swift_user_type_segments(user_type_node, source: bytes) -> list[str] | None
     """Return the written path segments of a Swift user_type (generics stripped).
 
     `Outer<A>.Inner<B>` is one user_type whose type_identifier children are the
-    segments; the type_arguments between them are not part of the path. None
-    when there is no segment or a segment reads empty.
+    segments; the type_arguments between them are not part of the path. A
+    trailing metatype segment is dropped (`Outer.Inner.Type` -> `Outer`,
+    `Inner`). None when there is no segment or a segment reads empty.
     """
     segments: list[str] = []
     for c in user_type_node.children:
@@ -1440,6 +1441,10 @@ def _swift_user_type_segments(user_type_node, source: bytes) -> list[str] | None
             if not text:
                 return None
             segments.append(text)
+    # A metatype (`Widget.Type`, `P.Protocol`) names its base type, not a
+    # nested `Type`/`Protocol` declaration.
+    if len(segments) > 1 and segments[-1] in ("Type", "Protocol"):
+        segments.pop()
     return segments or None
 
 def _swift_user_type_name(user_type_node, source: bytes) -> str | None:
