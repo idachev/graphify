@@ -298,7 +298,7 @@ The phases depend on each other, so they land in this order (decision АР6):
 - Each PR is correct on its own once the PRs before it have landed. Phase 2 without Phase 3
   fails closed on folded same-file nested types (see Phase 2, rule 5).
 
-### Fixed contracts (decisions АР1-АР22)
+### Fixed contracts (decisions АР1-АР22, АР24)
 
 Parallel implementers build against these names. A phase may not rename them.
 
@@ -420,6 +420,18 @@ Decisions АР9-АР22 close the remaining gaps between the phases:
 - **АР21** Resolved type edges keep `EXTRACTED` (Phase 2, rule 2).
 - **АР22** Each phase adds its own import line in `extract.py` next to the existing resolution
   imports; no placeholder stubs.
+- **АР24** Same-file constructor calls to nested types are deferred to Phase 4 (owner decision
+  КН1). In the Swift extractor's call walk (`engine.py:9543`, `engine.py:9567-9581`), a bare
+  non-member call whose callee label names a nested Swift type (a type node with a parent
+  type), or a label shared by 2+ Swift type nodes in the file, is not bound through the
+  bare-label map `label_to_nid` (`engine.py:8458-8463`). The call goes to `raw_calls`, and the
+  Phase 4 branch binds it through `_swift_lookup` + `_swift_caller_scope` (АР20) as an INFERRED
+  `calls` edge (`context="constructor"`, `confidence_score=0.85`). A label that names a single
+  top-level Swift type keeps today's same-file EXTRACTED binding. Phase 3 and Phase 4 ship
+  together upstream. *Reason:* after Phase 3 the bare-label map binds `State()` in both
+  `A.runA()` and `B.runB()` to one `State`. *Rejected:* an owner-chain lookup of nested types
+  in the extractor (a second copy of the lookup rule and a new map); accepting the wrong
+  binding for v1.
 
 ### Phase 1: mark real declarations (RC1, RC2)
 
@@ -568,6 +580,9 @@ referenced stay as they are today.
   #2810. Ids without a collision are unchanged.
 - A bare in-body reference (`func f(_ s: State)`) now misses the same-file shortcut and resolves
   through Phase 2's lexical lookup.
+- A same-file constructor call to a nested type (`State()` inside `A.runA()`), or to a label
+  shared by 2+ Swift types in the file, is no longer bound by the extractor's bare-label map;
+  it stays a raw call for Phase 4 (АР24). This is why Phase 3 ships with Phase 4.
 - Bump `_AST_CACHE_SCHEMA` (АР5).
 
 ### Phase 4: constructor calls with module-scope evidence (RC4)
@@ -589,7 +604,9 @@ generic candidate filtering:
   - `"ambiguous"` or `"unresolved"`: `continue`, with no fallback to the generic tie-breakers.
   - `"external"`: fall through to the existing logic (free functions, Objective-C).
 
-This covers `via_stub` calls and bare `Foo(...)` calls without an annotation alike. For Swift
+This covers `via_stub` calls, bare `Foo(...)` calls without an annotation, and the same-file
+calls to nested types that the extractor defers (АР24) alike. Those same-file calls change
+from EXTRACTED to INFERRED. For Swift
 calls it takes the place of the `via_stub` evidence gate at `extract.py:10798`: a
 `"resolved"` hit is the evidence, the Swift counterpart of the C# `stub_scope_hit`
 (`extract.py:10586-10598`). The JS/TS no-import skip at `extract.py:10785-10797` is not a
@@ -768,6 +785,12 @@ Phase 4 (`tests/test_swift_cross_file_calls.py`):
 - Regression `test_constructor_call_not_visible_lexically_stays_unresolved`: the only `Config`
   is `Outer.Config`; `Config()` elsewhere gets no edge.
 - Control `test_ambiguous_constructor_callee_stays_unresolved`: two top-level `Config`; no edge.
+- Regression `test_same_file_nested_constructor_binds_own_type` (with Phase 3):
+  `struct A { struct State {}; func runA() { State() } }; struct B { struct State {};
+  func runB() { State() } }` in one file; `runA()` calls `A.State` and `runB()` calls
+  `B.State`, each an INFERRED `calls` edge with `context == "constructor"` (АР24).
+- Control `test_same_file_top_level_constructor_stays_extracted`: a single top-level
+  `struct Foo` and `func make() { Foo() }` in one file keep today's EXTRACTED `calls` edge.
 
 Phase 5 (`tests/test_swift_import_resolution.py`). `extract()` never calls
 `deduplicate_entities` (its only caller is `build.py:1921`), so these tests call
