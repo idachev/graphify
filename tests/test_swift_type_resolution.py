@@ -1,0 +1,473 @@
+"""Swift cross-file type resolution, Phase 2: qualified names and lexical lookup.
+
+See docs/swift-cross-file-type-resolution-rfc.md ("Test plan", Phase 2). The style
+follows tests/test_swift_cross_file_calls.py: write the files into ``tmp_path`` and call
+``extract(files, cache_root=..., root=..., parallel=False)``.
+
+Several nodes share a label such as ``State`` or ``Inner``, so a label assertion passes
+on a wrong binding. Every test therefore names the *target node*: its label, its
+``source_file`` and the label of its parent ``contains`` edge. The target is found by
+those properties, not by a hard-coded id, so the tests hold both before and after the
+nested-type id change of Phase 3.
+
+``_swift_scope`` and ``_swift_lookup`` are run-local edge attributes that ``extract()``
+pops at the end, so nothing here asserts them. The outcome of the lookup is read from
+the edge target: a repointed edge reaches the declaration, a declined edge stays on a
+sourceless stub.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from graphify.extract import extract, extract_swift
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _write(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _extract(files: list[Path], tmp_path: Path) -> dict:
+    return extract(files, cache_root=tmp_path / "cache", root=tmp_path / "src", parallel=False)
+
+
+def _sf(node: dict) -> str:
+    return str(node.get("source_file") or "").replace("\\", "/")
+
+
+def _by_id(result: dict) -> dict[str, dict]:
+    return {n["id"]: n for n in result["nodes"]}
+
+
+def _is_stub(result: dict, nid: str) -> bool:
+    """A sourceless node: what an unresolved type reference leaves behind."""
+    node = _by_id(result).get(nid)
+    return node is not None and not _sf(node)
+
+
+def _parent_labels(result: dict, nid: str) -> set[str]:
+    """Labels of the nodes that hold ``nid`` through a ``contains`` edge."""
+    by_id = _by_id(result)
+    return {
+        by_id[e["source"]].get("label", "")
+        for e in result["edges"]
+        if e.get("relation") == "contains" and e.get("target") == nid and e["source"] in by_id
+    }
+
+
+def _node(result: dict, label: str, suffix: str, parent: str | None = None) -> str:
+    """The id of the one sourced node ``label`` from ``suffix``, optionally under ``parent``."""
+    found = [
+        n["id"] for n in result["nodes"]
+        if n.get("label") == label and _sf(n).endswith(suffix)
+        and (parent is None or parent in _parent_labels(result, n["id"]))
+    ]
+    assert len(found) == 1, (
+        f"expected one {label!r} in {suffix} (parent={parent!r}), got {found}"
+    )
+    return found[0]
+
+
+def _targets(result: dict, source: str, relations=("references",)) -> set[str]:
+    return {
+        e["target"] for e in result["edges"]
+        if e.get("source") == source and e.get("relation") in relations
+    }
+
+
+def _assert_declaration(result: dict, nid: str, label: str, suffix: str, parent: str) -> None:
+    node = _by_id(result)[nid]
+    assert node.get("label") == label
+    assert _sf(node).endswith(suffix), f"{nid} comes from {_sf(node)!r}, not {suffix}"
+    assert parent in _parent_labels(result, nid), (
+        f"{nid} is held by {_parent_labels(result, nid)}, not by {parent!r}"
+    )
+
+
+# ── fixtures ──────────────────────────────────────────────────────────────────
+
+def _pane_layout_files(base: Path) -> list[Path]:
+    return [
+        _write(base / "App/Models/PaneLayout.swift", (
+            "import Foundation\n\n"
+            "struct PaneLayout: Equatable {\n"
+            "    var panes: [Pane]\n"
+            "    struct Pane: Equatable { var id: Int }\n"
+            "}\n"
+        )),
+        _write(base / "App/Reducer/LayoutFeature.swift", (
+            "import Foundation\n\n"
+            "struct LayoutFeature {\n"
+            "    struct State {\n"
+            "        var layout: PaneLayout\n"
+            "        var focused: PaneLayout.Pane?\n"
+            "    }\n"
+            "}\n"
+        )),
+    ]
+
+
+def _two_reducers(base: Path) -> list[Path]:
+    """Two features that both declare a nested ``State``."""
+    return [
+        _write(base / "Features/LayoutFeature.swift",
+               "struct LayoutFeature {\n    struct State { var n: Int }\n}\n"),
+        _write(base / "Features/OtherFeature.swift",
+               "struct OtherFeature {\n    struct State { var m: Int }\n}\n"),
+    ]
+
+
+# ── regressions ───────────────────────────────────────────────────────────────
+
+def test_qualified_nested_reference_resolves_to_nested_type(tmp_path: Path):
+    # `var focused: PaneLayout.Pane?` was reduced to its head and bound to PaneLayout.
+    files = _pane_layout_files(tmp_path / "src")
+    result = _extract(files, tmp_path)
+
+    pane = _node(result, "Pane", "PaneLayout.swift", parent="PaneLayout")
+    _assert_declaration(result, pane, "Pane", "PaneLayout.swift", "PaneLayout")
+    state = _node(result, "State", "LayoutFeature.swift", parent="LayoutFeature")
+    layout = _node(result, "PaneLayout", "PaneLayout.swift")
+
+    targets = _targets(result, state)
+    assert pane in targets, "State.focused must reach the nested Pane declaration"
+    assert layout in targets, "State.layout still reaches PaneLayout"
+    assert not [t for t in targets if _by_id(result)[t].get("label") == "PaneLayout.Pane"], (
+        "the repointed qualified reference must not leave its stub behind"
+    )
+
+
+def test_bare_nested_name_resolves_lexically_in_extension(tmp_path: Path):
+    # Inside `extension LayoutFeature`, a bare `State` means LayoutFeature.State and
+    # not the State of another reducer.
+    base = tmp_path / "src"
+    files = _two_reducers(base) + [
+        _write(base / "Features/LayoutFeature+Ext.swift",
+               "extension LayoutFeature {\n    func f(_ s: State) {}\n}\n"),
+    ]
+    result = _extract(files, tmp_path)
+
+    own = _node(result, "State", "LayoutFeature.swift", parent="LayoutFeature")
+    other = _node(result, "State", "OtherFeature.swift", parent="OtherFeature")
+    _assert_declaration(result, own, "State", "LayoutFeature.swift", "LayoutFeature")
+    f = _node(result, ".f()", "LayoutFeature+Ext.swift")
+
+    targets = _targets(result, f)
+    assert own in targets
+    assert other not in targets
+
+
+def test_bare_name_not_visible_lexically_stays_on_stub(tmp_path: Path):
+    # The only `Config` is `Outer.Config`; a bare `Config` outside `Outer` never means it.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "Outer.swift", "enum Outer {\n    struct Config { var a: Int }\n}\n"),
+        _write(base / "User.swift", "struct User {\n    var config: Config\n}\n"),
+    ]
+    result = _extract(files, tmp_path)
+
+    nested = _node(result, "Config", "Outer.swift", parent="Outer")
+    user = _node(result, "User", "User.swift")
+    targets = _targets(result, user)
+    assert nested not in targets, "a bare Config must not bind to Outer.Config"
+    stubs = [t for t in targets if _by_id(result)[t].get("label") == "Config"]
+    assert stubs and all(_is_stub(result, t) for t in stubs), "the reference stays on its stub"
+
+
+def test_extension_of_nested_type_merges(tmp_path: Path):
+    # `extension LayoutFeature.State` merges into the nested declaration.
+    base = tmp_path / "src"
+    files = _two_reducers(base) + [
+        _write(base / "Features/State+Ext.swift",
+               "extension LayoutFeature.State {\n    func reset() {}\n}\n"),
+    ]
+    result = _extract(files, tmp_path)
+
+    own = _node(result, "State", "LayoutFeature.swift", parent="LayoutFeature")
+    other = _node(result, "State", "OtherFeature.swift", parent="OtherFeature")
+    reset = _node(result, ".reset()", "State+Ext.swift")
+
+    methods = {
+        e["source"] for e in result["edges"]
+        if e.get("relation") == "method" and e.get("target") == reset
+    }
+    assert methods == {own}, f"reset() must attach to LayoutFeature.State only, got {methods}"
+    assert other not in methods
+    leftovers = [
+        n["id"] for n in result["nodes"]
+        if n.get("label") in ("State", "LayoutFeature.State") and _sf(n).endswith("State+Ext.swift")
+    ]
+    assert not leftovers, f"the extension must not survive as its own node: {leftovers}"
+
+
+def test_qualified_conformance_and_generic_args_resolve(tmp_path: Path):
+    # A qualified base type and a qualified generic argument reach the nested declarations.
+    base = tmp_path / "src"
+    files = _pane_layout_files(base) + [
+        _write(base / "Outer.swift", "enum Outer {\n    class Base { func hello() {} }\n}\n"),
+        _write(base / "Child.swift", "class Child: Outer.Base {}\n"),
+        _write(base / "Holder.swift",
+               "struct Holder {\n    var x: [String: PaneLayout.Pane]\n}\n"),
+    ]
+    result = _extract(files, tmp_path)
+
+    outer_base = _node(result, "Base", "Outer.swift", parent="Outer")
+    pane = _node(result, "Pane", "PaneLayout.swift", parent="PaneLayout")
+    child = _node(result, "Child", "Child.swift")
+    holder = _node(result, "Holder", "Holder.swift")
+
+    assert outer_base in _targets(result, child, ("inherits", "implements"))
+    assert pane in _targets(result, holder)
+
+
+def test_type_table_records_full_path(tmp_path: Path):
+    # The per-file extractor result keeps the written dotted path and the scope of the
+    # property, so the corpus pass can resolve `focused.xxx()` against the right type.
+    path = _write(tmp_path / "src/LayoutFeature.swift", (
+        "struct LayoutFeature {\n"
+        "    var plain: PaneLayout\n"
+        "    struct State {\n"
+        "        var focused: PaneLayout.Pane?\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = extract_swift(path)
+
+    table = result["swift_type_table"]["table"]
+    scopes = result["swift_type_table"]["scopes"]
+    assert table["focused"] == "PaneLayout.Pane"
+    assert scopes["focused"] == "LayoutFeature.State"
+    assert table["plain"] == "PaneLayout"
+    assert scopes["plain"] == "LayoutFeature"
+
+
+def test_member_call_through_nested_type_annotation(tmp_path: Path):
+    # `x: Outer.Inner` + `x.go()` binds to Inner.go().
+    base = tmp_path / "src"
+    files = [
+        _write(base / "Outer.swift", "enum Outer {\n    class Inner {\n        func go() {}\n    }\n}\n"),
+        _write(base / "User.swift", (
+            "class User {\n"
+            "    var x: Outer.Inner\n"
+            "    func run() {\n"
+            "        x.go()\n"
+            "    }\n"
+            "}\n"
+        )),
+    ]
+    result = _extract(files, tmp_path)
+
+    inner = _node(result, "Inner", "Outer.swift", parent="Outer")
+    go = _node(result, ".go()", "Outer.swift")
+    run = _node(result, ".run()", "User.swift")
+    assert any(
+        e.get("relation") == "method" and e.get("source") == inner and e.get("target") == go
+        for e in result["edges"]
+    ), "go() is a method of Outer.Inner"
+    assert go in _targets(result, run, ("calls",))
+
+
+def test_qualified_identity_survives_incremental_update(tmp_path: Path):
+    # Change only a consumer of `Outer.Inner`. The declaration arrives as resolution
+    # context, so the identity (`_swift_qualified`) has to ride through the context-node
+    # marker tuples. A second `Inner` under `Other` rules out a label-only fallback.
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    _write(corpus / "Outer.swift", "enum Outer {\n    struct Inner { var a: Int }\n}\n")
+    _write(corpus / "Other.swift", "enum Other {\n    struct Inner { var b: Int }\n}\n")
+    consumer = _write(corpus / "Consumer.swift", "struct Consumer {\n    var i: Outer.Inner\n}\n")
+    graph_path = corpus / "graphify-out" / "graph.json"
+
+    def graph() -> dict:
+        data = json.loads(graph_path.read_text(encoding="utf-8"))
+        return {"nodes": data["nodes"], "edges": data["links"]}
+
+    def reached(result: dict) -> set[str]:
+        return _targets(result, _node(result, "Consumer", "Consumer.swift"))
+
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    full = graph()
+    inner = _node(full, "Inner", "Outer.swift", parent="Outer")
+    other = _node(full, "Inner", "Other.swift", parent="Other")
+    assert inner in reached(full)
+    assert other not in reached(full)
+
+    consumer.write_text(
+        "struct Consumer {\n    var i: Outer.Inner\n    func again() {}\n}\n", encoding="utf-8",
+    )
+    assert _rebuild_code(corpus, changed_paths=[consumer], no_cluster=True,
+                         acquire_lock=False) is True
+    incremental = graph()
+    assert _node(incremental, "Inner", "Outer.swift", parent="Outer") == inner
+    assert inner in reached(incremental), "the changed consumer still reaches Outer.Inner"
+    assert other not in reached(incremental)
+
+
+def test_type_declarations_resolve_with_absolute_paths(tmp_path: Path, monkeypatch):
+    # The same fixture, extracted with absolute and with relative paths, and with
+    # colliding path slugs (`Cfg/Helpers.swift`, `Cfg_Helpers.swift` both slug to
+    # `cfg_helpers`), reaches the same target ids.
+    root = tmp_path.resolve()
+    src = root / "src"
+    _write(src / "Cfg/Helpers.swift", "enum A {\n    struct Inner { var a: Int }\n}\n")
+    _write(src / "Cfg_Helpers.swift", "enum B {\n    struct Inner { var b: Int }\n}\n")
+    _write(src / "Use.swift", "struct Use {\n    var a: A.Inner\n    var b: B.Inner\n}\n")
+    names = ["Cfg/Helpers.swift", "Cfg_Helpers.swift", "Use.swift"]
+
+    def check(result: dict) -> tuple[str, str]:
+        inner_a = _node(result, "Inner", "Cfg/Helpers.swift", parent="A")
+        inner_b = _node(result, "Inner", "Cfg_Helpers.swift", parent="B")
+        assert inner_a != inner_b
+        targets = _targets(result, _node(result, "Use", "Use.swift"))
+        assert {inner_a, inner_b} <= targets, f"both qualified references must resolve: {targets}"
+        return inner_a, inner_b
+
+    absolute = extract([src / n for n in names], cache_root=root / "cache-abs",
+                       root=src, parallel=False)
+    abs_ids = check(absolute)
+
+    monkeypatch.chdir(src)
+    relative = extract([Path(n) for n in names], cache_root=root / "cache-rel",
+                       root=src, parallel=False)
+    assert check(relative) == abs_ids
+
+
+# ── controls ──────────────────────────────────────────────────────────────────
+
+def test_ambiguous_bare_name_stays_on_stub(tmp_path: Path):
+    # Two top-level `Config` in different files: no edge, the stub is kept.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "One/Config.swift", "struct Config { var a: Int }\n"),
+        _write(base / "Two/Config.swift", "struct Config { var b: Int }\n"),
+        _write(base / "User.swift", "struct User {\n    var config: Config\n}\n"),
+    ]
+    result = _extract(files, tmp_path)
+
+    one = _node(result, "Config", "One/Config.swift")
+    two = _node(result, "Config", "Two/Config.swift")
+    targets = _targets(result, _node(result, "User", "User.swift"))
+    assert one not in targets and two not in targets
+    stubs = [t for t in targets if _by_id(result)[t].get("label") == "Config"]
+    assert stubs and all(_is_stub(result, t) for t in stubs)
+
+
+def test_member_call_dotted_type_does_not_bind_concatenated_label(tmp_path: Path):
+    # `x: Outer.Inner` must not bind to a type labelled `OuterInner` (the key function
+    # strips non-alphanumerics, so the dotted name would match it by accident).
+    base = tmp_path / "src"
+    files = [
+        _write(base / "Outer.swift", "enum Outer {\n    class Inner {\n        func go() {}\n    }\n}\n"),
+        _write(base / "OuterInner.swift", "class OuterInner {\n    func go() {}\n}\n"),
+        _write(base / "User.swift", (
+            "class User {\n"
+            "    var x: Outer.Inner\n"
+            "    func run() {\n"
+            "        x.go()\n"
+            "    }\n"
+            "}\n"
+        )),
+    ]
+    result = _extract(files, tmp_path)
+
+    wrong = _node(result, ".go()", "OuterInner.swift")
+    assert wrong not in {
+        e["target"] for e in result["edges"] if e.get("relation") == "calls"
+    }, "x.go() must not bind to OuterInner.go()"
+
+
+def test_same_file_duplicate_nested_names_stay_ambiguous(tmp_path: Path):
+    # `A.State` and `B.State` declared in one file, referenced from another. Before the
+    # nested-id change of Phase 3 both fold into one node holding two qualified paths,
+    # so a lookup that lands on it declines (nothing binds). With distinct nested ids
+    # each reference reaches its own State. Either way no reference reaches the wrong one.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "Features.swift", (
+            "struct A {\n    struct State { var a: Int }\n}\n"
+            "struct B {\n    struct State { var b: Int }\n}\n"
+        )),
+        _write(base / "Consumer.swift", (
+            "struct Consumer {\n    var a: A.State\n    var b: B.State\n}\n"
+        )),
+    ]
+    result = _extract(files, tmp_path)
+
+    states = [n["id"] for n in result["nodes"]
+              if n.get("label") == "State" and _sf(n).endswith("Features.swift")]
+    targets = _targets(result, _node(result, "Consumer", "Consumer.swift"))
+    if len(states) == 1:
+        assert states[0] not in targets, "a folded two-path node must not be bound"
+        assert any(_is_stub(result, t) for t in targets), "the references stay on stubs"
+    else:
+        a_state = _node(result, "State", "Features.swift", parent="A")
+        b_state = _node(result, "State", "Features.swift", parent="B")
+        assert {a_state, b_state} <= targets
+
+
+def test_no_cross_language_binding(tmp_path: Path):
+    # A TypeScript `class Store` in the corpus is never the target of a Swift reference,
+    # bare or qualified. The qualified one still reaches the Swift nested `Outer.Store`.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "web/Store.ts", "export class Store {\n  save() { return 1; }\n}\n"),
+        _write(base / "ios/Outer.swift", "enum Outer {\n    struct Store { var a: Int }\n}\n"),
+        _write(base / "ios/User.swift", (
+            "struct User {\n    var bare: Store\n    var qualified: Outer.Store\n}\n"
+        )),
+    ]
+    result = _extract(files, tmp_path)
+
+    ts_store = _node(result, "Store", "Store.ts")
+    swift_store = _node(result, "Store", "Outer.swift", parent="Outer")
+    for e in result["edges"]:
+        if str(e.get("source_file") or "").endswith(".swift"):
+            assert e.get("target") != ts_store, f"Swift edge {e.get('relation')} bound to the TS Store"
+    targets = _targets(result, _node(result, "User", "User.swift"))
+    assert ts_store not in targets
+    assert swift_store in targets, "Outer.Store reaches the Swift nested declaration"
+
+
+def test_swift_reference_to_non_swift_type_keeps_generic_rewire(tmp_path: Path):
+    # A Swift reference to an Objective-C class is "external" for the Swift pass and
+    # keeps today's generic rewire onto the ObjC declaration.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "Legacy/Legacy.h", "@interface LegacyThing : NSObject\n- (void)ping;\n@end\n"),
+        _write(base / "Legacy/Legacy.m",
+               '#import "Legacy.h"\n@implementation LegacyThing\n- (void)ping {}\n@end\n'),
+        _write(base / "App/Holder.swift", "final class Holder {\n    var thing: LegacyThing?\n}\n"),
+    ]
+    result = _extract(files, tmp_path)
+
+    holder = _node(result, "Holder", "Holder.swift")
+    targets = _targets(result, holder)
+    objc = [t for t in targets
+            if _by_id(result)[t].get("label") == "LegacyThing"
+            and _sf(_by_id(result)[t]).endswith((".h", ".m"))]
+    assert objc, f"the Swift reference must reach the ObjC LegacyThing, got {targets}"
+    assert not any(_is_stub(result, t) and _by_id(result)[t].get("label") == "LegacyThing"
+                   for t in targets), "no stub is left for the resolved reference"
+
+
+@pytest.mark.parametrize("name", ["PaneLayout.Pane", "Outer.Inner"])
+def test_dotted_external_name_keeps_its_full_label_on_stub(tmp_path: Path, name: str):
+    # Nothing in the corpus declares the type: the stub keeps the written dotted label
+    # (RFC open question 4), so a later declaration can still be told apart.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "User.swift", f"struct User {{\n    var x: {name}\n}}\n"),
+    ]
+    result = _extract(files, tmp_path)
+
+    targets = _targets(result, _node(result, "User", "User.swift"))
+    labels = {_by_id(result)[t].get("label") for t in targets}
+    assert name in labels, f"expected a stub labelled {name!r}, got {labels}"
+    assert all(_is_stub(result, t) for t in targets if _by_id(result)[t].get("label") == name)
