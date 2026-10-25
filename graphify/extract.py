@@ -4823,10 +4823,9 @@ def _resolve_swift_member_calls(
         # declaring file's local type table.
         call_file = rc.get("source_file", "")
         is_swift_call = str(call_file).lower().endswith(".swift")
-        if not is_swift_call and not type_table_by_file:
-            # Without any Swift type table the pass used to return early; keep
-            # that for other languages so a Ruby `Inner.go()` does not bind a
-            # Swift-only `Inner` (gt1 r1 F1).
+        if not is_swift_call:
+            # Swift callers only: a Ruby `Inner.go()` must not bind a Swift-only
+            # `Inner`; other languages bind their member calls in their own passes.
             continue
         type_scope: str | None = ""
         factory_nid = None
@@ -4835,8 +4834,7 @@ def _resolve_swift_member_calls(
             type_qualified = True
             # A bare type name written in a caller is looked up from the
             # caller's enclosing type (АР20); None = no single scope, bind nothing.
-            if is_swift_call:
-                type_scope = _swift_caller_scope(caller, method_owner, node_by_id)
+            type_scope = _swift_caller_scope(caller, method_owner, node_by_id)
         else:
             type_name = type_table_by_file.get(call_file, {}).get(receiver)
             type_qualified = False
@@ -4868,12 +4866,8 @@ def _resolve_swift_member_calls(
         # and parks like any member call whose type cannot be bound. This
         # replaces the `_key` strip that turned
         # `Outer.Inner` into `outerinner`.
-        # Calls from other languages share `all_raw_calls`; they keep the label-key
-        # path, which still counts same-named definitions of every language.
         if factory_nid is not None:
             lookup_status, lookup_nid = "resolved", factory_nid
-        elif not is_swift_call:
-            lookup_status, lookup_nid = "external", None
         elif type_scope is None:
             lookup_status, lookup_nid = "ambiguous", None
         else:

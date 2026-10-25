@@ -389,3 +389,32 @@ def test_ruby_type_qualified_call_does_not_bind_swift_type_without_type_table(tm
         and e.get("target") in swift_go
         for e in result["edges"]
     )
+
+
+def test_ruby_call_does_not_bind_swift_type_when_a_swift_type_table_exists(tmp_path: Path):
+    # The Swift member-call pass handles Swift callers only: with a Swift type
+    # table in the corpus, a Ruby `Inner.go()` still binds nothing in Swift.
+    base = tmp_path / "src"
+    swift = _write(base / "Inner.swift", (
+        "class Inner {\n    static func go() {}\n}\n"
+        "class Holder {\n    let inner: Inner = Inner()\n    func f() {\n        inner.go()\n    }\n}\n"
+    ))
+    ruby = _write(base / "use.rb", "def run\n  Inner.go()\nend\n")
+    result = _run([swift, ruby], tmp_path)
+
+    swift_go = set(_nodes_by_file(result, swift, ".go()"))
+    assert swift_go
+    holder_f = _nodes_by_file(result, swift, ".f()")
+    assert len(holder_f) == 1 and swift_go <= _call_targets(result, holder_f[0]), (
+        "the Swift caller must still bind (a type table exists)"
+    )
+    ruby_nids = {
+        n["id"] for n in result["nodes"]
+        if str(n.get("source_file", "")).endswith(ruby.name)
+    }
+    assert ruby_nids
+    assert not any(
+        e.get("relation") == "calls" and e.get("source") in ruby_nids
+        and e.get("target") in swift_go
+        for e in result["edges"]
+    )
