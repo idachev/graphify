@@ -108,16 +108,6 @@ Objective-C interop (#1556), so it needs its own tests: Swift to a C++ `class In
 binds nothing, Swift to an ObjC `@interface Widget` in `.h` still binds `-render`, and a Swift
 extension folded onto an ObjC class still binds.
 
-## ТД7 Real same-file receiver conflicts bind nothing under the flat receiver table
-
-**Evidence.** On the supacode app, five receivers are written with different types in one file
-and so get `scopes[name] = None` (АР25): `content.hibernate` (twice), `defaults.seed`,
-`nsView.update` and `state.syncGlobalDefaults`. Their member calls bind nothing, a missing edge.
-The table is flat per file: `_swift_set_type_scope` in `graphify/extractors/engine.py:6245-6253`.
-
-**Why not here.** The fix scopes receiver types by the caller function instead of by file,
-which changes the АР25 contract and the `swift_type_table` record format settled in АР3/АР12.
-
 ## ТД8 The in-file Swift receiver bind matches by label only
 
 **Evidence.** Pre-existing. With a single write for a receiver (`var x: State`), the Swift
@@ -126,5 +116,40 @@ the file's bare-label map (`label_to_nid.get(callee_name)`, `engine.py:9967`), s
 same-named `go` of another type in the same file. The АР25 guard (`engine.py:9992-9999`) covers
 only conflicting writes.
 
-**Why not here.** Pre-existing behaviour outside the documented phases; task ЗД28 (under review)
-starts on it for agreed same-type writes, which keep only a method of that type.
+**Why not here.** Pre-existing behaviour outside the documented phases. The unmerged ЗД28
+branch (ТД10) narrows the bind to a method of the receiver's type only for agreed same-type
+writes, and it is not on this branch.
+
+## ТД9 Inherited methods are not looked up by the Swift member-call resolver
+
+**Evidence.** Pre-existing. `_resolve_swift_member_calls` looks up the called method only on the
+receiver's own type, `method_index.get((type_nid, _key(callee)))` in
+`graphify/extract.py:4941`. A method declared only on a superclass is not found, so the call gets a type-only `references` edge to the receiver type
+(`graphify/extract.py:4948-4949`) instead of a `calls` edge to the inherited method.
+
+**Why not here.** It needs an inheritance and conformance walk in the resolver, a new mechanism
+outside the five phases.
+
+## ТД10 Same-file member calls bind nothing when a receiver name is written twice
+
+**Evidence.** The per-file receiver table sets `scopes[name] = None` for any two writes of a
+name that differ in type or enclosing scope (АР25, fail-closed), even when both name the same
+type: `_swift_set_type_scope` in `graphify/extractors/engine.py:6245-6253`. On the supacode
+app 21 real same-file member calls bind nothing for this reason, for example
+`dragModel.reset()` in `PaneTabStripView.swift` (to `PaneTabDragModel.reset`),
+`shortcut.effective(from:)` in `AppShortcuts.swift` (to `AppShortcut.effective`) and
+`content.hibernate()` in `ContentRuntimeTests.swift`. A receiver written with the same type in
+two enclosing types, or spelled `Outer.T` and `T`, is enough.
+
+A fix exists on the local branch `captain/20261023-swift-xfile-types-zd28` (head `f98dde7a`,
+not pushed). Its closed fail-closed rule (panel КН4) treats two writes as one type only when
+that is proven: the type is a struct, enum, protocol, actor or a class without an inheritance
+clause, every prefix of the path is declared in the file, and no base-class lookup is needed.
+It restores 8 of the 21 calls. Its last fix (r3 F1, prefix kind check, `f98dde7a`) is
+unreviewed. 5 of the 21 are real conflicts, written with different types (`content.hibernate`
+twice, `defaults.seed`, `nsView.update`, `state.syncGlobalDefaults`); they need receiver types
+scoped by the caller function, a change of the АР25 contract and of the `swift_type_table`
+record format settled in АР3/АР12.
+
+**Why not here.** The ЗД28 review loop reached its bound of three re-reviews, and each round
+found new holes (4, then 2, then 1), so the refinement was not merged.

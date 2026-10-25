@@ -898,11 +898,12 @@ section still differs (the Phase 3 salting rule), these notes take precedence.
   (shadowed locals included), the extractor stores `scopes[name] = None`; the `table` value
   stays. `_resolve_swift_member_calls` binds nothing for such a name and does not park it, so
   the cross-repo pass cannot bind a locally declared name to a foreign type. The same holds
-  for an `"ambiguous"` lookup; only `"unresolved"` and `"external"` park. Writes that name the
-  same type keep one scope, even when they differ in spelling (`Coordinator` and
-  `Outline.Coordinator`) or in enclosing scope: they keep the common enclosing path, and the
-  in-file bind then keeps only a method of that type. Only writes of different types give
-  `None` (task ЗД28).
+  for an `"ambiguous"` lookup; only `"unresolved"` and `"external"` park. The rule is
+  fail-closed for any differing write: two writes of the same type in two enclosing types, or
+  spelled `Outer.T` and `T`, also give `None`. A refinement that keeps one scope for writes
+  proven to name the same type exists on the local, unpushed branch
+  `captain/20261023-swift-xfile-types-zd28` and is not part of this branch
+  (`docs/TODO-swift-cross-file-types.md`, ТД10).
 - **Sugar extensions.** `extension [T]`, `extension [K: V]` and `extension T?` extend
   `Swift.Array`, `Swift.Dictionary` and `Swift.Optional` (label, id and `_swift_qualified`).
   Reading the written text would slug to `T`'s own id, give `T` a second qualified path and
