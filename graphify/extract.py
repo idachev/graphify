@@ -5046,6 +5046,13 @@ def _resolve_python_member_calls(
     def _key(label: str) -> str:
         return re.sub(r"[^a-zA-Z0-9]+", "", str(label)).lower()
 
+    def _is_python_file(source_file: object) -> bool:
+        # The effective suffix honours a `.graphifyrc` language override. An
+        # extensionless file (a shebang script) or a raw call that names no file
+        # is unknown and passes, as before the gate.
+        suffix = effective_suffix(str(source_file or "")).lower()
+        return not suffix or suffix in (".py", ".pyi")
+
     node_by_id: dict[str, dict] = {n.get("id"): n for n in all_nodes}
 
     # A class owns methods: it is the source of one or more `method` edges. Index
@@ -5061,7 +5068,9 @@ def _resolve_python_member_calls(
         if src and tgt:
             owner_of[tgt] = src
         cnode = node_by_id.get(src)
-        if cnode is not None:
+        # Only Python classes are candidates: a Swift `Inner` must not trip the
+        # single-definition guard for a Python `Inner`.
+        if cnode is not None and _is_python_file(cnode.get("source_file")):
             class_def_nids.setdefault(_key(cnode.get("label", "")), []).append(src)
         tnode = node_by_id.get(tgt)
         if tnode is not None:
@@ -5182,13 +5191,6 @@ def _resolve_python_member_calls(
                 return parent
             parent = nid = up
         return None
-
-    def _is_python_file(source_file: object) -> bool:
-        # The effective suffix honours a `.graphifyrc` language override. An
-        # extensionless file (a shebang script) or a raw call that names no file
-        # is unknown and passes, as before the gate.
-        suffix = effective_suffix(str(source_file or "")).lower()
-        return not suffix or suffix in (".py", ".pyi")
 
     def _emit_call(
         caller: str, target_nid: "str | None", rc: dict, inferred: bool = False
