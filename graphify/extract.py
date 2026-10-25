@@ -3937,6 +3937,11 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
         if not key:
             continue
         if node.get("source_file"):
+            if node.get("_swift_extension_only"):
+                # `extension View` with no declaration of its own is not a
+                # definition: references from other files stay on their stub,
+                # as for `Int` (#4574).
+                continue
             if _is_type_like_definition(node):
                 # Match stubs case-SENSITIVELY: a `Path` reference must not rewire to a
                 # `PATH` env var (#1581). Fold only for genuinely case-insensitive
@@ -4153,36 +4158,56 @@ def _merge_swift_extensions(
     per_file: list[dict],
     all_nodes: list[dict],
     all_edges: list[dict],
+    context_nodes: list[dict] | None = None,
+    context_edges: list[dict] | None = None,
 ) -> None:
     """Collapse cross-file Swift `extension Foo` nodes into the canonical `Foo`.
 
     tree-sitter-swift reuses `class_declaration` for both `class Foo` and
     `extension Foo`, and node ids carry the file stem, so each file that
     extends `Foo` produces its own `Foo` node. The match is done by label:
-    when exactly one non-extension declaration shares the label, extension
-    nodes redirect onto it. Extensions of types outside the corpus (no match)
-    and ambiguous labels (more than one match) are left untouched — picking
-    arbitrarily would invent edges.
+    when exactly one declaration shares the label, extension-only nodes
+    redirect onto it. Extensions of types outside the corpus (no match) and
+    ambiguous labels (more than one match) are left untouched — picking
+    arbitrarily would invent edges — and keep `_swift_extension_only`.
+
+    A declaration with an extension in its own file shares that extension's
+    id (`declared: True` in its record); it is a candidate and is never
+    remapped. On an incremental build `context_nodes` / `context_edges` (the
+    unchanged files) widen the candidates read-only, so an extension in a
+    changed file folds onto an unchanged declaration as in a full build.
     """
     extension_nids: set[str] = set()
+    declared_nids: set[str] = set()
     extension_labels: dict[str, str] = {}
     for result in per_file:
         for ext in result.get("swift_extensions", []) or []:
-            extension_nids.add(ext["nid"])
+            if ext.get("declared"):
+                declared_nids.add(ext["nid"])
+            else:
+                extension_nids.add(ext["nid"])
             extension_labels[ext["nid"]] = ext["label"]
 
     if not extension_nids:
         return
 
+    # Context holds unchanged files only, so a context node that shares an id
+    # with a fresh one is a distinct declaration (a stem collision) and must
+    # count, both for the guard below and for ambiguity, as in a full build.
+    candidate_nodes = all_nodes + list(context_nodes or [])
     # A genuine Swift type is the target of a `contains` edge from its file node;
     # bare-reference shadow nodes (`let x: Foo`) carry a source_file but are NOT
     # contained, so excluding them keeps a stub from making a real type look
     # ambiguous — same predicate the Swift member-call resolver uses (#2538).
-    contained = {e.get("target") for e in all_edges if e.get("relation") == "contains"}
+    contained = {
+        e.get("target")
+        for e in all_edges + list(context_edges or [])
+        if e.get("relation") == "contains"
+    }
 
     label_to_canonical: dict[str, list[str]] = {}
-    for n in all_nodes:
-        if n.get("id") in extension_nids:
+    for n in candidate_nodes:
+        if n.get("_swift_extension_only"):
             continue
         label = n.get("label")
         if not label:
@@ -4200,9 +4225,14 @@ def _merge_swift_extensions(
         if not (n.get("source_file") and n.get("id") in contained and _is_type_like_definition(n)):
             continue
         label_to_canonical.setdefault(label, []).append(n["id"])
+    canonical_ids = {nid for nids in label_to_canonical.values() for nid in nids}
 
     remap: dict[str, str] = {}
     for ext_nid in extension_nids:
+        # Two files with one stem can mint one id for a declaration and an
+        # extension; remapping it would drop the declaration with it.
+        if ext_nid in declared_nids or ext_nid in canonical_ids:
+            continue
         candidates = label_to_canonical.get(extension_labels[ext_nid], [])
         if len(candidates) != 1:
             continue
@@ -4214,14 +4244,26 @@ def _merge_swift_extensions(
         return
 
     all_nodes[:] = [n for n in all_nodes if n.get("id") not in remap]
+    # An initializer in the extension (`static let value = VM()`) is walked with
+    # the type node as its caller, so its raw call would keep a deleted caller.
+    # These are the same dicts as extract()'s all_raw_calls.
+    for result in per_file:
+        for rc in result.get("raw_calls", []) or []:
+            if rc.get("caller_nid") in remap:
+                rc["caller_nid"] = remap[rc["caller_nid"]]
 
     # Each extension file's `contains` edge ends up pointing at the canonical
     # type — multiple files containing the same node is the intended shape:
     # the type owns the methods, the files own their slice. Self-loops are
     # dropped (e.g. an in-file extension method whose call already pointed at
     # the canonical type).
+    # `context` is in the key: `func run(_ x: Foo) -> Foo` emits a
+    # `parameter_type` and a `return_type` reference on one line.
     def _key_of(e: dict, src: str, tgt: str) -> tuple:
-        return (src, tgt, e.get("relation"), e.get("source_file"), e.get("source_location"))
+        return (
+            src, tgt, e.get("relation"), e.get("source_file"),
+            e.get("source_location"), e.get("context"),
+        )
 
     rewritten: list[dict] = []
     seen_keys: set[tuple] = set()
@@ -10253,7 +10295,10 @@ def extract(
     # graph is identical regardless of scan root (#2072).
     _repoint_python_package_imports(paths, all_nodes, all_edges, root)
     _repoint_python_sibling_imports(paths, all_nodes, all_edges, root)
-    _merge_swift_extensions(per_file, all_nodes, all_edges)
+    _merge_swift_extensions(
+        per_file, all_nodes, all_edges,
+        resolution_context_nodes, resolution_context_edges,
+    )
     # Salt colliding ids apart BEFORE the C# partial merge. The merge rewires the
     # edges of every half onto the canonical half's id; if that id collides with
     # another file's node (`Spec.cs` next to `_Spec.cs`, `Cfg/Helpers.cs` next to
