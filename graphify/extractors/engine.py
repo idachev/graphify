@@ -6237,20 +6237,68 @@ def _extract_generic(
     swift_body_scopes: dict[int, str] = {}
     # name -> enclosing type path for the `type_table` entries, threaded out as
     # `swift_type_table["scopes"]`; a name bound at file scope has no entry, and
-    # a name whose writes disagree on type or scope gets None (АР25).
+    # a name whose writes name different types gets None (АР25). Filled from
+    # `swift_type_writes` once the walk is done (`_swift_finish_type_scopes`).
     swift_type_scopes: dict[str, str | None] = {}
-    # name -> (type, scope) of its first `type_table` write ("" = file scope).
-    swift_type_first_writes: dict[str, tuple[str, str]] = {}
+    # name -> every (type, scope) `type_table` write, in order ("" = file scope).
+    swift_type_writes: dict[str, list[tuple[str, str]]] = {}
+    # name -> the in-file qualified path of its one type, for a name with
+    # several writes that all name that type (ЗД28); the in-file bind of
+    # `name.m()` must then land on a method of that type.
+    swift_agreed_types: dict[str, str] = {}
 
     def _swift_set_type_scope(name: str, type_name: str, scope: str) -> None:
-        # Called for every Swift `type_table[name]` write. The table is flat per
-        # file, so two writes that disagree make the name's scope unknown; the
-        # None sticks even when a later write agrees with the first one.
-        first = swift_type_first_writes.setdefault(name, (type_name, scope))
-        if first != (type_name, scope):
-            swift_type_scopes[name] = None
-        elif scope and name not in swift_type_scopes:
-            swift_type_scopes[name] = scope
+        # Called for every Swift `type_table[name]` write.
+        swift_type_writes.setdefault(name, []).append((type_name, scope))
+
+    def _swift_infile_type_path(type_name: str, scope: str, known: set[str]) -> str:
+        # The АР25 lexical lookup with this file's type paths only: innermost
+        # enclosing level first, then the absolute name.
+        parts = scope.split(".") if scope else []
+        while parts:
+            candidate = ".".join(parts) + "." + type_name
+            if candidate in known:
+                return candidate
+            parts.pop()
+        return type_name
+
+    def _swift_finish_type_scopes() -> None:
+        # The table is flat per file (АР25). Writes of one name that all mean
+        # the same type keep one scope, even from different enclosing types or
+        # spelled differently (`Coordinator` inside `Outer`, `Outer.Coordinator`
+        # elsewhere): the scope is the common enclosing path of the writes that
+        # spelled the kept table value, checked to look up that same type. Writes
+        # that mean different types make the scope None (АР25).
+        if not swift_type_writes:
+            return
+        if not swift_nested_plan:
+            swift_nested_plan.extend(_swift_nested_scan(root, source))
+        known = set(swift_nested_plan[0]) | set(swift_nested_plan[1])
+        for name, writes in swift_type_writes.items():
+            distinct = set(writes)
+            if len(distinct) == 1:
+                if writes[0][1]:
+                    swift_type_scopes[name] = writes[0][1]
+                continue
+            paths = {_swift_infile_type_path(t, s, known) for t, s in distinct}
+            kept = type_table.get(name)
+            spelled = [s.split(".") if s else [] for t, s in distinct if t == kept]
+            if len(paths) != 1 or not spelled:
+                swift_type_scopes[name] = None
+                continue
+            common: list[str] = []
+            for level in zip(*spelled):
+                if len(set(level)) != 1:
+                    break
+                common.append(level[0])
+            scope = ".".join(common)
+            (path,) = paths
+            if _swift_infile_type_path(kept, scope, known) != path:
+                swift_type_scopes[name] = None
+                continue
+            if scope:
+                swift_type_scopes[name] = scope
+            swift_agreed_types[name] = path
 
     if config.ts_module == "tree_sitter_swift":
         swift_protocol_names, swift_class_names = _swift_pre_scan(root, source)
@@ -9997,6 +10045,23 @@ def _extract_generic(
                         and swift_type_scopes[swift_receiver] is None
                     ):
                         tgt_nid = None
+                    # Swift `x.go()` on a receiver whose several writes all name
+                    # one type (ЗД28): the bare-label map may hold a same-named
+                    # method of another type, so keep only a method of x's type
+                    # and leave anything else to the corpus resolver.
+                    if (
+                        config.ts_module == "tree_sitter_swift"
+                        and is_member_call
+                        and tgt_nid
+                        and swift_receiver in swift_agreed_types
+                    ):
+                        _swift_agreed = swift_agreed_types[swift_receiver]
+                        _swift_agreed_nid = (
+                            swift_path_nids.get(_swift_agreed)
+                            or _swift_nested_path_nid(_swift_agreed)
+                        )
+                        if not _swift_agreed_nid or method_owner.get(tgt_nid) != _swift_agreed_nid:
+                            tgt_nid = None
                     # Swift `State()` naming a nested or same-file-duplicated
                     # type: defer to extract()'s lexical lookup (АР24). A hit on
                     # the caller's own method is not a bare-label binding and stays.
@@ -10510,6 +10575,7 @@ def _extract_generic(
             body_scope = swift_body_scopes.get(id(body_node), "")
             for local_name, local_type in body_bindings:
                 _swift_set_type_scope(local_name, local_type, body_scope)
+        _swift_finish_type_scopes()
 
     # JS/TS: bodies already walked with their own caller_nid (const-assigned
     # arrows, methods). An INLINE/returned arrow or function-expression that is
