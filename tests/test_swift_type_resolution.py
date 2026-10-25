@@ -779,3 +779,112 @@ def test_shadowed_local_with_different_type_scope_is_none(tmp_path: Path):
     assert result["swift_type_table"]["scopes"]["x"] is None
     # The walk pops the later sibling first, so the nested `Other()` binding is kept.
     assert result["swift_type_table"]["table"]["x"] == "Other"
+
+
+# ── Phase 3 review round 1 (ЗД12 r1 F1, F2, F3, F5) ───────────────────────────
+
+def _labelled(result: dict, label: str, suffix: str) -> list[str]:
+    return [n["id"] for n in result["nodes"]
+            if n.get("label") == label and _sf(n).endswith(suffix)]
+
+
+def test_nested_type_beside_private_computed_property_and_case_both_kept(tmp_path: Path):
+    # r1 F1: an enum case and a computed property keep their plain id, so a nested
+    # type of the same slug is salted even when it is the only public name.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "Outer.swift", (
+            "struct Outer {\n"
+            "    struct State { var n: Int }\n"
+            "    var _state: Int { 0 }\n"
+            "}\n"
+        )),
+        _write(base / "Status.swift", (
+            "enum Status {\n"
+            "    struct Delegate { var n: Int }\n"
+            "    case _delegate\n"
+            "}\n"
+        )),
+    ]
+    result = _extract(files, tmp_path)
+
+    outer = _node(result, "Outer", "Outer.swift")
+    state = _node(result, "State", "Outer.swift", parent="Outer")
+    prop = _method_of(result, outer, "._state")
+    assert state != prop
+    status = _node(result, "Status", "Status.swift")
+    delegate = _node(result, "Delegate", "Status.swift", parent="Status")
+    cases = [e["target"] for e in result["edges"]
+             if e.get("relation") == "case_of" and e.get("source") == status]
+    assert _labelled(result, "_delegate", "Status.swift") == cases
+    assert delegate not in cases
+
+
+def test_nested_type_and_same_slug_method_in_same_file_extension_both_kept(tmp_path: Path):
+    # r1 F2: the collision scan covers every same-file body of the parent, so a
+    # method declared in `extension Outer` does not swallow the nested `State`.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "Outer.swift", (
+            "struct Outer {\n"
+            "    struct State { var n: Int }\n"
+            "}\n"
+            "extension Outer {\n"
+            "    func state() {}\n"
+            "}\n"
+        )),
+    ]
+    result = _extract(files, tmp_path)
+
+    outer = _node(result, "Outer", "Outer.swift")
+    state = _node(result, "State", "Outer.swift", parent="Outer")
+    method = _method_of(result, outer, ".state()")
+    assert state != method
+    assert _sf(_by_id(result)[method]).endswith("Outer.swift")
+
+
+def test_nested_type_and_method_of_the_same_name_both_kept(tmp_path: Path):
+    # r1 F3: `struct State` and `func State()` share the exact name, so a salt by
+    # name alone cannot tell them apart; the type salts a kind-tagged name.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "Outer.swift", (
+            "struct Outer {\n"
+            "    struct State { var n: Int }\n"
+            "    func State() {}\n"
+            "}\n"
+        )),
+    ]
+    result = _extract(files, tmp_path)
+
+    outer = _node(result, "Outer", "Outer.swift")
+    state = _node(result, "State", "Outer.swift", parent="Outer")
+    method = _method_of(result, outer, ".State()")
+    assert state != method
+
+
+def test_same_file_extension_of_salted_nested_type_keeps_its_owner(tmp_path: Path):
+    # r1 F5: `State` keeps the plain id and `_State` is salted. A same-file
+    # `extension Outer._State` takes `_State`'s real id, so `extra()` belongs to
+    # `_State` and `State` gains no second qualified path.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "Outer.swift", (
+            "struct Outer {\n"
+            "    struct State { var n: Int }\n"
+            "    struct _State { var m: Int }\n"
+            "}\n"
+            "extension Outer._State {\n"
+            "    func extra() {}\n"
+            "}\n"
+        )),
+    ]
+    result = _extract(files, tmp_path)
+
+    state = _node(result, "State", "Outer.swift", parent="Outer")
+    private_state = _node(result, "_State", "Outer.swift", parent="Outer")
+    assert state != private_state
+    _method_of(result, private_state, ".extra()")
+    assert not [e for e in result["edges"]
+                if e.get("relation") == "method" and e.get("source") == state]
+    assert _by_id(result)[state].get("_swift_qualified", ["Outer.State"]) == ["Outer.State"]
