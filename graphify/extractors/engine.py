@@ -1564,16 +1564,16 @@ def _swift_nested_scan(root_node, source: bytes) -> tuple[dict[str, list], dict[
     return bodies, nested
 
 
-def _swift_type_facts(root_node, source: bytes) -> tuple[set[str], dict[str, list[str]], set[str]]:
-    """What the receiver-scope agreement check (ЗД28) needs from one Swift file.
+def _swift_type_facts(root_node, source: bytes) -> tuple[set[str], set[str], set[str]]:
+    """What the receiver-scope agreement check (ЗД28, КН4 A) needs from one Swift file.
 
-    Returns ``(declared, bases, shadowing)``: the qualified paths of the types
-    DECLARED here (extensions excluded), the inherited type names written on
-    each declaration or extension by its path, and every name a ``typealias``
-    or a generic parameter declares anywhere in the file.
+    Returns ``(declared, inheriting, shadowing)``: the qualified paths of the
+    types DECLARED here (extensions excluded), those of them that are a class
+    with an inheritance clause (a superclass may bring nested types), and
+    every name a ``typealias`` or a generic parameter declares in the file.
     """
     declared: set[str] = set()
-    bases: dict[str, list[str]] = {}
+    inheriting: set[str] = set()
     shadowing: set[str] = set()
 
     def _visit(node, enclosing: str | None) -> None:
@@ -1593,17 +1593,15 @@ def _swift_type_facts(root_node, source: bytes) -> tuple[set[str], dict[str, lis
                 else:
                     path = f"{enclosing}.{name}" if enclosing else name
                     declared.add(path)
-                for spec in c.children:
-                    if spec.type == "inheritance_specifier":
-                        ident = next((x for x in spec.children if x.type == "user_type"), None)
-                        if ident is not None:
-                            bases.setdefault(path, []).append(_read_text(ident, source))
+                    if (any(x.type == "class" for x in c.children)
+                            and any(x.type == "inheritance_specifier" for x in c.children)):
+                        inheriting.add(path)
                 _visit(c, path)
             else:
                 _visit(c, enclosing)
 
     _visit(root_node, None)
-    return declared, bases, shadowing
+    return declared, inheriting, shadowing
 
 
 def _swift_pre_scan(root_node, source: bytes) -> tuple[set[str], set[str]]:
@@ -6294,31 +6292,35 @@ def _extract_generic(
         swift_type_writes.setdefault(name, []).append((type_name, scope))
 
     def _swift_infile_type_path(type_name: str, scope: str, known: set[str],
-                                declared: set[str] | None = None,
-                                bases: dict[str, list[str]] | None = None) -> str | None:
+                                facts: tuple[set[str], set[str]] | None = None) -> str | None:
         # The АР25 lexical lookup with this file's type paths only: innermost
-        # enclosing level first, then the absolute name. With `declared` and
-        # `bases` (the ЗД28 agreement check) a level also tries the nested types
-        # of its in-file base classes, and None means unproven: the lookup left
-        # a level that is only an extension here (another file may nest a type
-        # of that name in it), or it ends on a type not declared in this file.
+        # enclosing level first, then the absolute name. With `facts`
+        # (declared, inheriting) it is the ЗД28 proof (КН4 A, fail closed):
+        # None unless every level it passes is declared here and is no class
+        # with an inheritance clause, and every prefix of every candidate it
+        # meets that exists here is declared, not only extended.
         parts = scope.split(".") if scope else []
+        segments = type_name.split(".")
+
+        def _unproven(level: str) -> bool:
+            declared, inheriting = facts
+            if level and (level not in declared or level in inheriting):
+                return True
+            for i in range(1, len(segments) + 1):
+                prefix = ".".join(([level] if level else []) + segments[:i])
+                if prefix not in declared and (prefix in known or not level):
+                    return True
+            return False
+
         while parts:
             level = ".".join(parts)
+            if facts is not None and _unproven(level):
+                return None
             candidate = level + "." + type_name
             if candidate in known:
-                if declared is not None and candidate not in declared:
-                    return None
                 return candidate
-            if declared is not None:
-                for base in (bases or {}).get(level, ()):
-                    inherited = base + "." + type_name
-                    if base in declared and inherited in known:
-                        return inherited
-                if level not in declared:
-                    return None
             parts.pop()
-        if declared is not None and type_name not in declared:
+        if facts is not None and _unproven(""):
             return None
         return type_name
 
@@ -6336,7 +6338,7 @@ def _extract_generic(
         if not swift_nested_plan:
             swift_nested_plan.extend(_swift_nested_scan(root, source))
         known = set(swift_nested_plan[0]) | set(swift_nested_plan[1])
-        declared, bases, shadowing = _swift_type_facts(root, source)
+        declared, inheriting, shadowing = _swift_type_facts(root, source)
         for name, writes in swift_type_writes.items():
             distinct = set(writes)
             if len(distinct) == 1:
@@ -6345,7 +6347,7 @@ def _extract_generic(
                 continue
             paths = {
                 None if t.split(".")[0] in shadowing
-                else _swift_infile_type_path(t, s, known, declared, bases)
+                else _swift_infile_type_path(t, s, known, (declared, inheriting))
                 for t, s in distinct
             }
             kept = type_table.get(name)

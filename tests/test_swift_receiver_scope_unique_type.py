@@ -253,6 +253,8 @@ def test_r1_f2_generic_parameter_and_namesake_type_bind_nothing(tmp_path: Path):
 
 
 def test_r1_f3_inherited_nested_type_is_not_the_global_namesake(tmp_path: Path):
+    # КН4 A: a passed level that is a class with an inheritance clause is
+    # unproven (its superclass may nest a `State`), so `x` binds nothing.
     path = _write(tmp_path / "src/M.swift", (
         "struct State { func go() {} }\n"
         "class Base { struct State { func go() {} } }\n"
@@ -289,3 +291,50 @@ def test_r1_f4_type_declared_in_another_file_is_unproven(tmp_path: Path):
         "struct B { func b(_ x: Model) { x.go() } }\n"
     ))
     assert extract_swift(path)["swift_type_table"]["scopes"]["x"] is None
+
+
+# ── ЗД28 review round 2 (КН4 A, fail closed) ─────────────────────────────────
+
+def test_r2_f1_inherited_nested_type_through_an_intermediate_class_binds_nothing(tmp_path: Path):
+    path = _write(tmp_path / "src/M.swift", (
+        "struct State { func go() {} }\n"
+        "class Base { struct State { func go() {} } }\n"
+        "class Middle: Base {}\n"
+        "class A: Middle { func a(_ x: State) { x.go() } }\n"
+        "struct B { func b(_ x: State) { x.go() } }\n"
+    ))
+    scope, calls = _scope_and_calls(path, tmp_path, ".a()", ".go()")
+    assert scope is None
+    assert calls == set()
+
+
+def test_r2_f2_extension_only_prefix_binds_nothing(tmp_path: Path):
+    calls_file = _write(tmp_path / "src/Calls.swift", (
+        "struct Box { struct State { func go() {} } }\n"
+        "struct A { func a(_ x: Box.State) { x.go() } }\n"
+        "struct B { func b(_ x: Box.State) { x.go() } }\n"
+        "extension A.Box {}\n"
+    ))
+    types = _write(tmp_path / "src/Types.swift", (
+        "extension A { struct Box { struct State { func go() {} } } }\n"
+    ))
+    assert extract_swift(calls_file)["swift_type_table"]["scopes"]["x"] is None
+    result = extract([calls_file, types], cache_root=tmp_path / "cache",
+                     root=tmp_path / "src", parallel=False)
+    assert _owners_called(result, ".a()", ".go()") == set()
+    assert _owners_called(result, ".b()", ".go()") == set()
+
+
+def test_r2_subclass_of_external_class_is_unproven(tmp_path: Path):
+    # FileExplorerOutlineView.swift shape: one write sits in a subclass of an
+    # external class (NSOutlineView), which may nest a namesake type.
+    path = _write(tmp_path / "src/FileExplorerOutlineView.swift", (
+        "struct Outline {\n"
+        "    final class Coordinator { func removeKeyMonitor() {} }\n"
+        "    func dismantle(coordinator: Coordinator) { coordinator.removeKeyMonitor() }\n"
+        "}\n"
+        "final class OutlineNSView: NSOutlineView {\n"
+        "    var coordinator: Outline.Coordinator?\n"
+        "}\n"
+    ))
+    assert extract_swift(path)["swift_type_table"]["scopes"]["coordinator"] is None
