@@ -777,4 +777,5 @@ def test_shadowed_local_with_different_type_scope_is_none(tmp_path: Path):
     result = extract_swift(path)
 
     assert result["swift_type_table"]["scopes"]["x"] is None
-    assert result["swift_type_table"]["table"]["x"] in ("State", "Other")
+    # The walk pops the later sibling first, so the nested `Other()` binding is kept.
+    assert result["swift_type_table"]["table"]["x"] == "Other"
