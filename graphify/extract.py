@@ -4266,7 +4266,7 @@ def _merge_swift_extensions(
             continue
         ext_label = extension_labels[ext_nid]
         status, resolved_nid = _swift_lookup(swift_index, ext_label, "")
-        if status == "resolved":
+        if status == "resolved" and resolved_nid is not None:
             canonical_nid = resolved_nid
         elif status != "external":
             # Ambiguous or not declared at this path: keep the extension node
@@ -4675,8 +4675,8 @@ def _resolve_swift_member_calls(
         if tt and tt.get("path"):
             type_table_by_file[tt["path"]] = tt.get("table", {})
             scopes_by_file[tt["path"]] = tt.get("scopes", {})
-    if not type_table_by_file:
-        return
+    # No early return on an empty table set: a type-qualified call
+    # (`Inner.go()`) needs no table entry to bind.
 
     def _key(label: str) -> str:
         return re.sub(r"[^a-zA-Z0-9]+", "", str(label)).lower()
@@ -4704,7 +4704,7 @@ def _resolve_swift_member_calls(
             continue
         src, tgt = e.get("source"), e.get("target")
         tnode = node_by_id.get(tgt)
-        if tnode is not None:
+        if tnode is not None and src is not None and tgt is not None:
             method_index[(src, _key(tnode.get("label", "")))] = tgt
             method_owner[tgt] = src
 
@@ -4810,7 +4810,7 @@ def _resolve_swift_member_calls(
             if factory_type in _LANGUAGE_BUILTIN_GLOBALS:
                 continue
             status, factory_nid = _swift_lookup(swift_index, factory_type, scope)
-            if status == "resolved":
+            if status == "resolved" and factory_nid is not None:
                 factory_defs = [factory_nid]
             elif status == "external" and "." not in factory_type:
                 factory_defs = type_def_nids.get(_key(factory_type), [])
@@ -4843,7 +4843,12 @@ def _resolve_swift_member_calls(
         # (Type.staticMethod(), Singleton.shared.x()); otherwise look it up in the
         # declaring file's local type table.
         call_file = rc.get("source_file", "")
-        is_swift_call = str(call_file).lower().endswith(".swift")
+        # The effective suffix honours a `.graphifyrc` language override.
+        is_swift_call = effective_suffix(call_file).lower() == ".swift"
+        if not is_swift_call:
+            # Swift callers only: a Ruby `Inner.go()` must not bind a Swift-only
+            # `Inner`; other languages bind their member calls in their own passes.
+            continue
         type_scope: str | None = ""
         factory_nid = None
         if receiver[:1].isupper():
@@ -4851,8 +4856,7 @@ def _resolve_swift_member_calls(
             type_qualified = True
             # A bare type name written in a caller is looked up from the
             # caller's enclosing type (АР20); None = no single scope, bind nothing.
-            if is_swift_call:
-                type_scope = _swift_caller_scope(caller, method_owner, node_by_id)
+            type_scope = _swift_caller_scope(caller, method_owner, node_by_id)
         else:
             type_name = type_table_by_file.get(call_file, {}).get(receiver)
             type_qualified = False
@@ -4884,17 +4888,13 @@ def _resolve_swift_member_calls(
         # and parks like any member call whose type cannot be bound. This
         # replaces the `_key` strip that turned
         # `Outer.Inner` into `outerinner`.
-        # Calls from other languages share `all_raw_calls`; they keep the label-key
-        # path, which still counts same-named definitions of every language.
         if factory_nid is not None:
             lookup_status, lookup_nid = "resolved", factory_nid
-        elif not is_swift_call:
-            lookup_status, lookup_nid = "external", None
         elif type_scope is None:
             lookup_status, lookup_nid = "ambiguous", None
         else:
             lookup_status, lookup_nid = _swift_lookup(swift_index, type_name, type_scope)
-        if lookup_status == "resolved":
+        if lookup_status == "resolved" and lookup_nid is not None:
             type_defs = [lookup_nid]
         elif lookup_status == "ambiguous":
             continue
@@ -4911,7 +4911,7 @@ def _resolve_swift_member_calls(
             # (#3152). This resolver shares `all_raw_calls` with every other
             # language and Swift raw_calls carry no `lang` tag, so the parked
             # entry's language comes from the declaring file's suffix.
-            if str(rc.get("source_file", "")).lower().endswith(".swift"):
+            if is_swift_call:
                 _park_unresolved_member_call(
                     node_by_id.get(caller), callee, type_name, "swift", rc,
                 )

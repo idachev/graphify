@@ -367,3 +367,76 @@ def test_conflicting_scope_member_call_not_parked_for_cross_repo(tmp_path: Path)
     for node in run_nodes:
         parked = (node.get("metadata") or {}).get("unresolved_calls") or []
         assert parked == []
+
+
+def test_ruby_type_qualified_call_does_not_bind_swift_type_without_type_table(tmp_path: Path):
+    # No Swift file yields a type table here; a Ruby `Inner.go()` must not bind
+    # the Swift-only `Inner.go()` (gt1 r1 F1: base behaviour of the removed early return).
+    base = tmp_path / "src"
+    swift = _write(base / "Inner.swift", "class Inner {\n    static func go() {}\n}\n")
+    ruby = _write(base / "use.rb", "def run\n  Inner.go()\nend\n")
+    result = _run([swift, ruby], tmp_path)
+
+    swift_go = set(_nodes_by_file(result, swift, ".go()"))
+    assert swift_go
+    ruby_nids = {
+        n["id"] for n in result["nodes"]
+        if str(n.get("source_file", "")).endswith(ruby.name)
+    }
+    assert ruby_nids
+    assert not any(
+        e.get("relation") == "calls" and e.get("source") in ruby_nids
+        and e.get("target") in swift_go
+        for e in result["edges"]
+    )
+
+
+def test_ruby_call_does_not_bind_swift_type_when_a_swift_type_table_exists(tmp_path: Path):
+    # The Swift member-call pass handles Swift callers only: with a Swift type
+    # table in the corpus, a Ruby `Inner.go()` still binds nothing in Swift.
+    base = tmp_path / "src"
+    swift = _write(base / "Inner.swift", (
+        "class Inner {\n    static func go() {}\n}\n"
+        "class Holder {\n    let inner: Inner = Inner()\n    func f() {\n        inner.go()\n    }\n}\n"
+    ))
+    ruby = _write(base / "use.rb", "def run\n  Inner.go()\nend\n")
+    result = _run([swift, ruby], tmp_path)
+
+    swift_go = set(_nodes_by_file(result, swift, ".go()"))
+    assert swift_go
+    holder_f = _nodes_by_file(result, swift, ".f()")
+    assert len(holder_f) == 1 and swift_go <= _call_targets(result, holder_f[0]), (
+        "the Swift caller must still bind (a type table exists)"
+    )
+    ruby_nids = {
+        n["id"] for n in result["nodes"]
+        if str(n.get("source_file", "")).endswith(ruby.name)
+    }
+    assert ruby_nids
+    assert not any(
+        e.get("relation") == "calls" and e.get("source") in ruby_nids
+        and e.get("target") in swift_go
+        for e in result["edges"]
+    )
+
+
+def test_member_call_in_language_override_swift_file_binds(tmp_path: Path):
+    # `.graphifyrc` `language.swifttpl=swift`: a remapped file is a Swift caller,
+    # so its typed member call binds like one in a `.swift` file (gt1 r2 F2).
+    base = tmp_path / "src"
+    _write(base / ".graphifyrc", "language.swifttpl=swift\n")
+    inner = _write(base / "Inner.swift", "class Inner { static func go() {} }\n")
+    use = _write(base / "Use.swifttpl", (
+        "class Holder {\n"
+        "    let inner: Inner = Inner()\n"
+        "    func run() {\n"
+        "        inner.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([inner, use], tmp_path)
+
+    run_nids = _nodes_by_file(result, use, ".run()")
+    assert len(run_nids) == 1
+    go_nids = set(_nodes_by_file(result, inner, ".go()"))
+    assert go_nids and go_nids <= _call_targets(result, run_nids[0])

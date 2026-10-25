@@ -1520,7 +1520,8 @@ def _swift_nested_scan(root_node, source: bytes) -> tuple[dict[str, list], dict[
                 if _swift_is_extension(c):
                     path = (
                         _swift_user_type_name(name_node, source)
-                        if name_node.type == "user_type" else None
+                        if name_node is not None and name_node.type == "user_type"
+                        else None
                     ) or name
                 else:
                     path = f"{enclosing}.{name}" if enclosing else name
@@ -9954,6 +9955,18 @@ def _extract_generic(
                         config.ts_module == "tree_sitter_c_sharp"
                         and node.type == "object_creation_expression"
                         and tgt_nid in method_owner
+                    ):
+                        tgt_nid = None
+                    # Swift `x.go()` on a receiver whose type-table writes
+                    # disagree on type or scope (АР25): the bare-label map would
+                    # pick whichever `go` was declared last. Bind nothing here;
+                    # the corpus resolver stops on the None scope too.
+                    if (
+                        config.ts_module == "tree_sitter_swift"
+                        and is_member_call
+                        and swift_receiver
+                        and swift_receiver in swift_type_scopes
+                        and swift_type_scopes[swift_receiver] is None
                     ):
                         tgt_nid = None
                     # Swift `State()` naming a nested or same-file-duplicated
