@@ -8507,6 +8507,30 @@ def _extract_generic(
         else:
             label_to_nid.setdefault(normalised, n["id"])
             label_to_nid_ci.setdefault(normalised.lower(), n["id"])
+    # Swift (АР24): the bare-label map above holds one node per label, so a
+    # `State()` inside `A.runA()` and inside `B.runB()` would both bind to
+    # whichever `State` was written last. A label that names a nested Swift type
+    # (one contained by another type) or 2+ Swift types of this file is not
+    # bound here; the call stays a raw call and extract() binds it through the
+    # caller's lexical scope. A unique top-level type keeps the same-file binding.
+    swift_type_nids: set[str] = set()
+    swift_scoped_ctor_labels: set[str] = set()
+    if config.ts_module == "tree_sitter_swift":
+        _swift_nested_type_nids = {
+            e["target"] for e in edges
+            if e.get("relation") == "contains"
+            and e.get("source") in callable_class_nids
+            and e.get("target") in callable_class_nids
+            and e.get("source") != e.get("target")
+        }
+        _swift_types_by_label: dict[str, set[str]] = {}
+        for n in nodes:
+            if n["id"] in callable_class_nids:
+                swift_type_nids.add(n["id"])
+                _swift_types_by_label.setdefault(n["label"], set()).add(n["id"])
+        for _label, _type_nids in _swift_types_by_label.items():
+            if len(_type_nids) > 1 or _type_nids & _swift_nested_type_nids:
+                swift_scoped_ctor_labels.add(_label)
 
     seen_call_pairs: set[tuple[str, str]] = set()
     seen_indirect_pairs: set[tuple[str, str]] = set()  # Python indirect_call dedup
@@ -9600,6 +9624,29 @@ def _extract_generic(
                         and tgt_nid in method_owner
                     ):
                         tgt_nid = None
+                    # Swift `State()` naming a nested or same-file-duplicated
+                    # type: defer to extract()'s lexical lookup (АР24). A hit on
+                    # the caller's own method is not a bare-label binding and stays.
+                    # Inside a type, a nested type of that name hides a same-named
+                    # free function, and the bare-label map holds whichever was
+                    # declared last, so a free-function fallback defers too; a
+                    # file-scope caller keeps the free function.
+                    if (
+                        config.ts_module == "tree_sitter_swift"
+                        and not is_member_call
+                        and tgt_nid
+                        and callee_name in swift_scoped_ctor_labels
+                    ):
+                        _swift_owner_scope: str | None = caller_nid
+                        while _swift_owner_scope and _swift_owner_scope not in method_owner:
+                            _swift_owner_scope = scope_parents.get(_swift_owner_scope)
+                        _swift_in_type = bool(_swift_owner_scope) or caller_nid in swift_type_nids
+                        if tgt_nid in swift_type_nids or (
+                            _swift_in_type
+                            and tgt_nid not in method_owner
+                            and tgt_nid == label_to_nid.get(callee_name)
+                        ):
+                            tgt_nid = None
                 # A name-only reference can leave a source-less stub behind when
                 # the target is outside the scanned corpus (for example,
                 # ``HTTPException`` imported from FastAPI). It is useful for the
