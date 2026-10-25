@@ -367,3 +367,25 @@ def test_conflicting_scope_member_call_not_parked_for_cross_repo(tmp_path: Path)
     for node in run_nodes:
         parked = (node.get("metadata") or {}).get("unresolved_calls") or []
         assert parked == []
+
+
+def test_ruby_type_qualified_call_does_not_bind_swift_type_without_type_table(tmp_path: Path):
+    # No Swift file yields a type table here; a Ruby `Inner.go()` must not bind
+    # the Swift-only `Inner.go()` (gt1 r1 F1: base behaviour of the removed early return).
+    base = tmp_path / "src"
+    swift = _write(base / "Inner.swift", "class Inner {\n    static func go() {}\n}\n")
+    ruby = _write(base / "use.rb", "def run\n  Inner.go()\nend\n")
+    result = _run([swift, ruby], tmp_path)
+
+    swift_go = set(_nodes_by_file(result, swift, ".go()"))
+    assert swift_go
+    ruby_nids = {
+        n["id"] for n in result["nodes"]
+        if str(n.get("source_file", "")).endswith(ruby.name)
+    }
+    assert ruby_nids
+    assert not any(
+        e.get("relation") == "calls" and e.get("source") in ruby_nids
+        and e.get("target") in swift_go
+        for e in result["edges"]
+    )

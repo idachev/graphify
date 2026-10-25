@@ -4823,6 +4823,11 @@ def _resolve_swift_member_calls(
         # declaring file's local type table.
         call_file = rc.get("source_file", "")
         is_swift_call = str(call_file).lower().endswith(".swift")
+        if not is_swift_call and not type_table_by_file:
+            # Without any Swift type table the pass used to return early; keep
+            # that for other languages so a Ruby `Inner.go()` does not bind a
+            # Swift-only `Inner` (gt1 r1 F1).
+            continue
         type_scope: str | None = ""
         factory_nid = None
         if receiver[:1].isupper():
