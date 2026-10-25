@@ -1379,6 +1379,77 @@ def _js_member_nid(class_nid: str, member_node, name: str, source: bytes,
                                   _JS_PRIVATE_MEMBER_PREFIXES)
 
 
+# Mirrors `_SWIFT_CONFIG` in extract.py: the declarations the walk mints under
+# their parent's id.
+_SWIFT_NESTED_TYPE_TYPES = ("class_declaration", "protocol_declaration")
+_SWIFT_MEMBER_FUNCTION_TYPES = (
+    "function_declaration", "protocol_function_declaration", "init_declaration",
+    "deinit_declaration", "subscript_declaration", "macro_declaration",
+)
+_SWIFT_NAME_FALLBACK_TYPES = ("simple_identifier", "type_identifier", "user_type")
+
+
+def _swift_nested_collision_groups(body_node, source: bytes, parent_nid: str) -> dict[str, set[str]]:
+    """Nested Swift types and members of one parent that mint one id.
+
+    A nested type's id is ``_make_id(parent_nid, name)``, the formula its
+    methods, computed properties and enum cases use too, and ids are caseless.
+    So ``struct State`` and ``func state()`` (or TCA's ``case delegate`` and
+    ``enum Delegate``) of one parent slug to one id, and ``add_node`` would drop
+    whichever is walked second (RFC Phase 3, r1 F10). Returns
+    ``{plain_nid: {raw names}}`` for every id in ``body_node`` that two or more
+    names share and at least one nested type holds, the groups
+    ``_underscore_salted_nid`` resolves. A collision among members alone is left
+    as it was, so ids without a nested type in the group are unchanged. The scan
+    reads only this body: a collision across two bodies of one parent (a type
+    and a same-file extension of it) is not caught.
+    """
+    names: dict[str, set[str]] = {}
+    type_nids: set[str] = set()
+
+    def _record(name: str | None, is_type: bool) -> None:
+        if not name or not normalize_id(name):
+            return
+        nid = _make_id(parent_nid, name)
+        names.setdefault(nid, set()).add(name)
+        if is_type:
+            type_nids.add(nid)
+
+    def _declared_name(decl) -> str | None:
+        # Same lookup as the walk: the `name` field, then the fallback child.
+        name_node = decl.child_by_field_name("name")
+        if name_node is None:
+            name_node = next(
+                (c for c in decl.children if c.type in _SWIFT_NAME_FALLBACK_TYPES), None
+            )
+        return _read_text(name_node, source) if name_node is not None else None
+
+    for child in body_node.children:
+        t = child.type
+        if t in _SWIFT_NESTED_TYPE_TYPES:
+            if any(c.type == "extension" for c in child.children):
+                continue
+            _record(_declared_name(child), True)
+        elif t == "deinit_declaration":
+            _record("deinit", False)
+        elif t == "subscript_declaration":
+            _record("subscript", False)
+        elif t in _SWIFT_MEMBER_FUNCTION_TYPES:
+            _record(_declared_name(child), False)
+        elif t == "enum_entry":
+            for c in child.children:
+                if c.type == "simple_identifier":
+                    _record(_read_text(c, source), False)
+        elif t == "property_declaration" and any(
+            c.type in ("computed_property", "willset_didset_block") for c in child.children
+        ):
+            _record(_swift_property_name(child, source), False)
+    return {
+        nid: ns for nid, ns in names.items()
+        if len(ns) >= 2 and nid in type_nids
+    }
+
+
 def _swift_pre_scan(root_node, source: bytes) -> tuple[set[str], set[str]]:
     """Pre-scan a Swift compilation unit and return (protocol_names, class_like_names)."""
     protocols: set[str] = set()
@@ -6016,6 +6087,21 @@ def _extract_generic(
 
     # JS/TS class body -> member collision groups, filled lazily (#4475).
     js_member_groups: dict = {}
+    # Swift (parent nid, body span) -> nested type / member collision groups,
+    # filled lazily (RFC Phase 3).
+    swift_nested_groups: dict = {}
+
+    def _swift_nested_nid(parent_nid: str, decl, name: str) -> str:
+        plain = _make_id(parent_nid, name)
+        body = decl.parent
+        if body is None:
+            return plain
+        key = (parent_nid, body.start_byte, body.end_byte)
+        groups = swift_nested_groups.get(key)
+        if groups is None:
+            groups = _swift_nested_collision_groups(body, source, parent_nid)
+            swift_nested_groups[key] = groups
+        return _underscore_salted_nid(plain, name, groups)
 
     python_underscore_groups: dict[str, set[str]] = {}
     if config.ts_module == "tree_sitter_python":
@@ -6227,6 +6313,11 @@ def _extract_generic(
                 class_nid = _underscore_salted_nid(class_nid, class_name, csharp_type_groups)
             if config.ts_module == "tree_sitter_python" and parent_class_nid:
                 class_nid = _make_id(parent_class_nid, class_name)
+            elif config.ts_module == "tree_sitter_swift" and parent_class_nid:
+                # A nested type is held by its parent's id, so `A.State` and
+                # `B.State` of one file stay apart; salted only when a sibling
+                # type or member slugs to the same id (RFC Phase 3).
+                class_nid = _swift_nested_nid(parent_class_nid, node, class_name)
             elif config.ts_module == "tree_sitter_python":
                 # `Session` / `session()`, `Foo` / `FOO` in one module (#2810).
                 class_nid = _underscore_salted_nid(class_nid, class_name, python_underscore_groups)
@@ -7723,6 +7814,9 @@ def _extract_generic(
                     func_nid = _js_member_nid(
                         parent_class_nid, node, sanitized_name, source, js_member_groups
                     )
+                elif config.ts_module == "tree_sitter_swift":
+                    # `func state()` beside a nested `struct State` (RFC r1 F10).
+                    func_nid = _swift_nested_nid(parent_class_nid, node, sanitized_name)
                 ruby_method_metadata = None
                 if ruby_method_kind is not None:
                     kinds = ruby_method_kinds.setdefault(func_nid, set())
