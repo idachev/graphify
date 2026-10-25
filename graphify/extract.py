@@ -4245,7 +4245,7 @@ def _merge_swift_extensions(
             continue
         ext_label = extension_labels[ext_nid]
         status, resolved_nid = _swift_lookup(swift_index, ext_label, "")
-        if status == "resolved":
+        if status == "resolved" and resolved_nid is not None:
             canonical_nid = resolved_nid
         elif status != "external":
             # Ambiguous or not declared at this path: keep the extension node
@@ -4654,8 +4654,8 @@ def _resolve_swift_member_calls(
         if tt and tt.get("path"):
             type_table_by_file[tt["path"]] = tt.get("table", {})
             scopes_by_file[tt["path"]] = tt.get("scopes", {})
-    if not type_table_by_file:
-        return
+    # No early return on an empty table set: a type-qualified call
+    # (`Inner.go()`) needs no table entry to bind.
 
     def _key(label: str) -> str:
         return re.sub(r"[^a-zA-Z0-9]+", "", str(label)).lower()
@@ -4683,7 +4683,7 @@ def _resolve_swift_member_calls(
             continue
         src, tgt = e.get("source"), e.get("target")
         tnode = node_by_id.get(tgt)
-        if tnode is not None:
+        if tnode is not None and src is not None and tgt is not None:
             method_index[(src, _key(tnode.get("label", "")))] = tgt
             method_owner[tgt] = src
 
@@ -4789,7 +4789,7 @@ def _resolve_swift_member_calls(
             if factory_type in _LANGUAGE_BUILTIN_GLOBALS:
                 continue
             status, factory_nid = _swift_lookup(swift_index, factory_type, scope)
-            if status == "resolved":
+            if status == "resolved" and factory_nid is not None:
                 factory_defs = [factory_nid]
             elif status == "external" and "." not in factory_type:
                 factory_defs = type_def_nids.get(_key(factory_type), [])
@@ -4873,7 +4873,7 @@ def _resolve_swift_member_calls(
             lookup_status, lookup_nid = "ambiguous", None
         else:
             lookup_status, lookup_nid = _swift_lookup(swift_index, type_name, type_scope)
-        if lookup_status == "resolved":
+        if lookup_status == "resolved" and lookup_nid is not None:
             type_defs = [lookup_nid]
         elif lookup_status == "ambiguous":
             continue

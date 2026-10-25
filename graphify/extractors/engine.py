@@ -1520,7 +1520,8 @@ def _swift_nested_scan(root_node, source: bytes) -> tuple[dict[str, list], dict[
                 if _swift_is_extension(c):
                     path = (
                         _swift_user_type_name(name_node, source)
-                        if name_node.type == "user_type" else None
+                        if name_node is not None and name_node.type == "user_type"
+                        else None
                     ) or name
                 else:
                     path = f"{enclosing}.{name}" if enclosing else name

@@ -3793,7 +3793,7 @@ _SWIFT_TYPE_REFERENCE_RELATIONS = frozenset({"references", "inherits", "implemen
 
 
 def _resolve_swift_type_references(
-    per_file: list[dict],
+    per_file: list[dict | None],
     paths: list[Path],
     all_nodes: list[dict],
     all_edges: list[dict],
