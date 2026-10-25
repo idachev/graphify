@@ -1406,14 +1406,15 @@ def _swift_is_extension(decl) -> bool:
     )
 
 
-# `extension [T]`, `extension [K: V]` and `extension T?` / `T!` extend the
-# standard generic behind the sugar, an external type. Reading the name node's
-# text (`[T]`) would slug to T's own id and stamp a second path on T.
+# `extension [T]`, `extension [K: V]` and `extension T?` extend the standard
+# generic behind the sugar, an external type. Reading the name node's text
+# (`[T]`) would slug to T's own id and stamp a second path on T. The sugar
+# always means the standard library type, so the target carries its `Swift.`
+# path: a project's own `struct Array` must not take the extension.
 _SWIFT_SUGAR_EXTENSION_TARGETS = {
-    "array_type": "Array",
-    "dictionary_type": "Dictionary",
-    "optional_type": "Optional",
-    "implicitly_unwrapped_optional_type": "Optional",
+    "array_type": "Swift.Array",
+    "dictionary_type": "Swift.Dictionary",
+    "optional_type": "Swift.Optional",
 }
 
 
@@ -1421,7 +1422,7 @@ def _swift_extension_path(name_node, source: bytes) -> str:
     """The written path of the type a Swift extension extends.
 
     `extension A.B` gives `"A.B"`, `extension Array<T>` gives `"Array"`, and
-    the sugar forms give their standard generic (`[T]` gives `"Array"`).
+    the sugar forms give their standard generic (`[T]` gives `"Swift.Array"`).
     """
     if name_node.type == "user_type":
         path = _swift_user_type_name(name_node, source)
@@ -6476,8 +6477,8 @@ def _extract_generic(
             class_name = synthetic_name if synthetic_name else _read_text(name_node, source)
             if (config.ts_module == "tree_sitter_swift" and name_node is not None
                     and _swift_is_extension(node)):
-                # `extension [T]` / `extension T?` extend Array / Optional, not
-                # T: the label, id and path all name the standard generic.
+                # `extension [T]` / `extension T?` extend Swift.Array /
+                # Swift.Optional, not T: label, id and path name the stdlib type.
                 class_name = _SWIFT_SUGAR_EXTENSION_TARGETS.get(name_node.type, class_name)
             ruby_absolute_declaration = (
                 config.ts_module == "tree_sitter_ruby" and class_name.startswith("::")
