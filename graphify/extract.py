@@ -5165,10 +5165,23 @@ def _resolve_python_member_calls(
             parent = nid = up
         return None
 
+    def _is_python_file(source_file: object) -> bool:
+        # The effective suffix honours a `.graphifyrc` language override. An
+        # extensionless file (a shebang script) or a raw call that names no file
+        # is unknown and passes, as before the gate.
+        suffix = effective_suffix(str(source_file or "")).lower()
+        return not suffix or suffix in (".py", ".pyi")
+
     def _emit_call(
         caller: str, target_nid: "str | None", rc: dict, inferred: bool = False
     ) -> None:
         if not target_nid or target_nid == caller or (caller, target_nid) in existing_pairs:
+            return
+        target_file = node_by_id.get(target_nid, {}).get("source_file")
+        if target_file and not _is_python_file(target_file):
+            # Python callers bind Python definitions only: `Inner.go()` in a .py
+            # file must not reach a Swift `Inner`, nor `SwiftArray.make()` the
+            # folded `Swift.Array`. Stubs and external modules carry no file.
             return
         if rc.get("_python_attr_read"):
             # An attribute read only runs a property getter, and only the one it
@@ -5254,6 +5267,11 @@ def _resolve_python_member_calls(
         if rc.get("_ambiguous_python_import"):
             continue
         if not rc.get("is_member_call"):
+            continue
+        if not _is_python_file(rc.get("source_file")):
+            # Python callers only: a Swift `Inner.go()` must not bind a Python
+            # `Inner`, nor `SwiftArray.make()` the folded `Swift.Array`; other
+            # languages bind their member calls in their own passes.
             continue
         receiver = rc.get("receiver")
         callee = rc.get("callee")
