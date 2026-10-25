@@ -412,7 +412,11 @@ Decisions АР9-АР22 close the remaining gaps between the phases:
   `Config` (`extract.py:4178-4211`). Phase 1 keeps the bare-label path; Phase 2 replaces it.
 - **АР19** In `_resolve_swift_member_calls`, only status `"external"` falls back to today's
   `_key(label)` path. `"resolved"` binds to that nid; `"ambiguous"` / `"unresolved"` bind
-  nothing and are parked as today's unresolved member calls.
+  nothing. Only `"unresolved"` is parked as today's unresolved member call (the name is not
+  visible from the scope and may live in another repository). `"ambiguous"` is not parked:
+  the local repository declares the name, as in today's "ambiguous -> bail"
+  (`extract.py:4706-4711` at `c588b72d`), so the cross-repo pass
+  (`cross_repo_calls.py`, `link_cross_repo_member_calls`) cannot bind it to a foreign type.
 - **АР20** `_swift_caller_scope`: a caller that is itself a Swift type node with exactly one
   `_swift_qualified` path uses that path (a property initializer is walked with the type as
   its caller, `engine.py:7341`); a caller found through `method` / `contains` uses its owner's
@@ -435,7 +439,8 @@ Decisions АР9-АР22 close the remaining gaps between the phases:
 - **АР25** The per-file `swift_type_table` stays flat (owner decision КН2 = fail-closed). When
   two writes for the same name in one file disagree on type or scope, the extractor stores
   `scopes[name] = None` (the `table` value stays); `_resolve_swift_member_calls` binds nothing
-  for a name whose scope is `None` (no edge; parked as an unresolved member call). The record
+  for a name whose scope is `None` (no edge, and not parked, so the cross-repo pass cannot bind
+  it to a foreign type, as for `"ambiguous"` in АР19). The record
   format stays. *Reason:* the table keeps the last write (`engine.py:7892-7899`), so one shared
   scope would send `x.go()` in both `A.runA(_ x: State)` and `B.runB(_ x: State)` to
   `B.State.go()`. *Rejected:* keying the table by owner (changes the settled АР3/АР12 format);
@@ -573,8 +578,9 @@ an outside type does not merge into a nested `Outer.Config` (`"unresolved"`). On
 folding.
 
 Member calls (АР3, АР19): `_resolve_swift_member_calls` resolves `table[name]` through
-`_swift_lookup` with `scopes[name]`. A name whose scope is `None` binds nothing: no edge, and
-the call is parked as an unresolved member call (АР25).
+`_swift_lookup` with `scopes[name]`. A name whose scope is `None` (АР25) and an `"ambiguous"`
+lookup (АР19) bind nothing and are not parked, so `graphify merge-graphs` cannot bind them to a
+same-named type in another repository; only `"unresolved"` and `"external"` park.
 
 Edges that the pass repoints leave their stubs unreferenced. Those stubs are dropped in the
 same way as in `_resolve_go_type_references` (`resolution.py:3705-3712`). Stubs that are still
@@ -763,11 +769,17 @@ Phase 2 (new `tests/test_swift_type_resolution.py`):
 - Regression `test_member_call_through_nested_parameter_type`: `A.State` and `B.State`;
   inside `A`, `func f(_ x: State) { x.go() }`, with `go()` in `extension A.State` in another
   file; `scopes["x"] == "A"` and the call binds to `A.State.go()`.
-- Control `test_member_call_same_param_name_in_two_types_binds_nothing`
+- Regression `test_member_call_same_param_name_in_two_types_binds_nothing`
   (`tests/test_swift_member_call_scopes.py`): one file with `A.State`, `B.State`,
   `A.runA(_ x: State) { x.go() }` and `B.runB(_ x: State) { x.go() }`, `go()` added by
   separate extensions; `scopes["x"] is None` and neither call binds, in particular not both
-  to `B.State.go()` (АР25).
+  to `B.State.go()` (АР25). The `scopes` assertion fails on baseline, which has no `scopes`
+  key; the no-binding part already holds there.
+- Regression `test_conflicting_scope_member_call_not_parked_for_cross_repo`
+  (`tests/test_swift_member_call_scopes.py`): the same file, plus a second repository with a
+  single `struct State { func go() {} }`. Neither call is parked, and
+  `link_cross_repo_member_calls` after `graphify merge-graphs` adds no edge to the other
+  repository's `State.go()` (АР19, АР25).
 - Regression `test_nested_base_class_resolves_lexically_in_extension`: `Outer.Base`, a
   top-level `Base`, and `extension Outer { class Derived: Base {} }` in another file; the
   `inherits` edge reaches `Outer.Base`.
