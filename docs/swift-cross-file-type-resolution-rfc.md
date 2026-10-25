@@ -298,7 +298,7 @@ The phases depend on each other, so they land in this order (decision АР6):
 - Each PR is correct on its own once the PRs before it have landed. Phase 2 without Phase 3
   fails closed on folded same-file nested types (see Phase 2, rule 5).
 
-### Fixed contracts (decisions АР1-АР22, АР24)
+### Fixed contracts (decisions АР1-АР22, АР24, АР25)
 
 Parallel implementers build against these names. A phase may not rename them.
 
@@ -432,6 +432,14 @@ Decisions АР9-АР22 close the remaining gaps between the phases:
   `A.runA()` and `B.runB()` to one `State`. *Rejected:* an owner-chain lookup of nested types
   in the extractor (a second copy of the lookup rule and a new map); accepting the wrong
   binding for v1.
+- **АР25** The per-file `swift_type_table` stays flat (owner decision КН2 = fail-closed). When
+  two writes for the same name in one file disagree on type or scope, the extractor stores
+  `scopes[name] = None` (the `table` value stays); `_resolve_swift_member_calls` binds nothing
+  for a name whose scope is `None` (no edge; parked as an unresolved member call). The record
+  format stays. *Reason:* the table keeps the last write (`engine.py:7892-7899`), so one shared
+  scope would send `x.go()` in both `A.runA(_ x: State)` and `B.runB(_ x: State)` to
+  `B.State.go()`. *Rejected:* keying the table by owner (changes the settled АР3/АР12 format);
+  accepting the wrong binding for v1.
 
 ### Phase 1: mark real declarations (RC1, RC2)
 
@@ -516,7 +524,9 @@ Extractor outputs. They change per-file records, so `_AST_CACHE_SCHEMA` gets a b
   (`prop_type` at `engine.py:7333`), parameters (`engine.py:7898-7899`) and locals
   (`_swift_local_var_types`, `engine.py:2984`). A new `swift_type_table["scopes"][name]` holds
   the innermost enclosing Swift type; for a parameter or a local, the enclosing type of the
-  function (АР12).
+  function (АР12). The table stays flat per file, and a later write with the same name wins
+  (`engine.py:7892-7899`). When two writes for the same name in one file disagree on type or
+  scope, the extractor stores `scopes[name] = None`; the `table` value stays (АР25).
 
 Symbol table (`_swift_type_index`, АР1):
 
@@ -563,7 +573,8 @@ an outside type does not merge into a nested `Outer.Config` (`"unresolved"`). On
 folding.
 
 Member calls (АР3, АР19): `_resolve_swift_member_calls` resolves `table[name]` through
-`_swift_lookup` with `scopes[name]`.
+`_swift_lookup` with `scopes[name]`. A name whose scope is `None` binds nothing: no edge, and
+the call is parked as an unresolved member call (АР25).
 
 Edges that the pass repoints leave their stubs unreferenced. Those stubs are dropped in the
 same way as in `_resolve_go_type_references` (`resolution.py:3705-3712`). Stubs that are still
@@ -752,6 +763,11 @@ Phase 2 (new `tests/test_swift_type_resolution.py`):
 - Regression `test_member_call_through_nested_parameter_type`: `A.State` and `B.State`;
   inside `A`, `func f(_ x: State) { x.go() }`, with `go()` in `extension A.State` in another
   file; `scopes["x"] == "A"` and the call binds to `A.State.go()`.
+- Control `test_member_call_same_param_name_in_two_types_binds_nothing`
+  (`tests/test_swift_member_call_scopes.py`): one file with `A.State`, `B.State`,
+  `A.runA(_ x: State) { x.go() }` and `B.runB(_ x: State) { x.go() }`, `go()` added by
+  separate extensions; `scopes["x"] is None` and neither call binds, in particular not both
+  to `B.State.go()` (АР25).
 - Regression `test_nested_base_class_resolves_lexically_in_extension`: `Outer.Base`, a
   top-level `Base`, and `extension Outer { class Derived: Base {} }` in another file; the
   `inherits` edge reaches `Outer.Base`.
