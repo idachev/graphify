@@ -1387,67 +1387,155 @@ _SWIFT_MEMBER_FUNCTION_TYPES = (
     "deinit_declaration", "subscript_declaration", "macro_declaration",
 )
 _SWIFT_NAME_FALLBACK_TYPES = ("simple_identifier", "type_identifier", "user_type")
+_SWIFT_TYPE_BODY_TYPES = ("class_body", "protocol_body", "enum_class_body")
 
 
-def _swift_nested_collision_groups(body_node, source: bytes, parent_nid: str) -> dict[str, set[str]]:
+def _swift_declared_name_node(decl):
+    """The name node of a Swift declaration, found the way the walk finds it."""
+    name_node = decl.child_by_field_name("name")
+    if name_node is None:
+        name_node = next(
+            (c for c in decl.children if c.type in _SWIFT_NAME_FALLBACK_TYPES), None
+        )
+    return name_node
+
+
+def _swift_is_extension(decl) -> bool:
+    return decl.type != "protocol_declaration" and any(
+        c.type == "extension" for c in decl.children
+    )
+
+
+def _swift_type_body(decl):
+    body = decl.child_by_field_name("body")
+    if body is not None:
+        return body
+    return next((c for c in decl.children if c.type in _SWIFT_TYPE_BODY_TYPES), None)
+
+
+def _swift_body_members(body_node, source: bytes) -> list[tuple[str, str]]:
+    """``(name, kind)`` of each declaration a Swift type body mints under its parent's id.
+
+    ``kind`` is ``"type"`` (a nested type), ``"method"`` (a function-like member:
+    its id goes through the collision salting) or ``"fixed"`` (an enum case or a
+    computed property: minted plain by its own branch and never salted).
+    """
+    members: list[tuple[str, str]] = []
+
+    def _add(name: str | None, kind: str) -> None:
+        if name and normalize_id(name):
+            members.append((name, kind))
+
+    for child in body_node.children:
+        t = child.type
+        if t in _SWIFT_NESTED_TYPE_TYPES:
+            if not _swift_is_extension(child):
+                name_node = _swift_declared_name_node(child)
+                _add(_read_text(name_node, source) if name_node is not None else None, "type")
+        elif t == "deinit_declaration":
+            _add("deinit", "method")
+        elif t == "subscript_declaration":
+            _add("subscript", "method")
+        elif t in _SWIFT_MEMBER_FUNCTION_TYPES:
+            name_node = _swift_declared_name_node(child)
+            _add(_read_text(name_node, source) if name_node is not None else None, "method")
+        elif t == "enum_entry":
+            for c in child.children:
+                if c.type == "simple_identifier":
+                    _add(_read_text(c, source), "fixed")
+        elif t == "property_declaration" and any(
+            c.type in ("computed_property", "willset_didset_block") for c in child.children
+        ):
+            _add(_swift_property_name(child, source), "fixed")
+    return members
+
+
+def _swift_nested_collision_groups(bodies, source: bytes,
+                                   parent_nid: str) -> dict[str, set[tuple[str, str]]]:
     """Nested Swift types and members of one parent that mint one id.
 
     A nested type's id is ``_make_id(parent_nid, name)``, the formula its
     methods, computed properties and enum cases use too, and ids are caseless.
     So ``struct State`` and ``func state()`` (or TCA's ``case delegate`` and
     ``enum Delegate``) of one parent slug to one id, and ``add_node`` would drop
-    whichever is walked second (RFC Phase 3, r1 F10). Returns
-    ``{plain_nid: {raw names}}`` for every id in ``body_node`` that two or more
-    names share and at least one nested type holds, the groups
-    ``_underscore_salted_nid`` resolves. A collision among members alone is left
-    as it was, so ids without a nested type in the group are unchanged. The scan
-    reads only this body: a collision across two bodies of one parent (a type
-    and a same-file extension of it) is not caught.
+    whichever is walked second (RFC Phase 3, r1 F10). ``bodies`` are every
+    same-file body that mints under the parent: its declaration and its
+    extensions. Returns ``{plain_nid: {(name, kind)}}`` (kinds as in
+    ``_swift_body_members``) for every id that two or more declarations share
+    and at least one nested type holds. A collision among members alone is left
+    as it was, so ids without a nested type in the group are unchanged.
     """
-    names: dict[str, set[str]] = {}
-    type_nids: set[str] = set()
-
-    def _record(name: str | None, is_type: bool) -> None:
-        if not name or not normalize_id(name):
-            return
-        nid = _make_id(parent_nid, name)
-        names.setdefault(nid, set()).add(name)
-        if is_type:
-            type_nids.add(nid)
-
-    def _declared_name(decl) -> str | None:
-        # Same lookup as the walk: the `name` field, then the fallback child.
-        name_node = decl.child_by_field_name("name")
-        if name_node is None:
-            name_node = next(
-                (c for c in decl.children if c.type in _SWIFT_NAME_FALLBACK_TYPES), None
-            )
-        return _read_text(name_node, source) if name_node is not None else None
-
-    for child in body_node.children:
-        t = child.type
-        if t in _SWIFT_NESTED_TYPE_TYPES:
-            if any(c.type == "extension" for c in child.children):
-                continue
-            _record(_declared_name(child), True)
-        elif t == "deinit_declaration":
-            _record("deinit", False)
-        elif t == "subscript_declaration":
-            _record("subscript", False)
-        elif t in _SWIFT_MEMBER_FUNCTION_TYPES:
-            _record(_declared_name(child), False)
-        elif t == "enum_entry":
-            for c in child.children:
-                if c.type == "simple_identifier":
-                    _record(_read_text(c, source), False)
-        elif t == "property_declaration" and any(
-            c.type in ("computed_property", "willset_didset_block") for c in child.children
-        ):
-            _record(_swift_property_name(child, source), False)
+    pairs: dict[str, set[tuple[str, str]]] = {}
+    for body in bodies:
+        for name, kind in _swift_body_members(body, source):
+            pairs.setdefault(_make_id(parent_nid, name), set()).add((name, kind))
     return {
-        nid: ns for nid, ns in names.items()
-        if len(ns) >= 2 and nid in type_nids
+        nid: ps for nid, ps in pairs.items()
+        if len(ps) >= 2 and any(kind == "type" for _, kind in ps)
     }
+
+
+def _swift_salted_member_nid(plain_nid: str, name: str, kind: str,
+                             group: set[tuple[str, str]] | None) -> str:
+    """The id of a nested type or a method in one Swift collision group.
+
+    Without an enum case or computed property in the group, the Python/C#
+    rule applies (``_underscore_salted_nid``: a unique public name keeps the
+    plain id). Those two kinds always keep the plain id, so with one of them
+    in the group every type and method is salted. A type and a method of the
+    very same name would get one salt, so the type salts a kind-tagged name.
+    """
+    if not group:
+        return plain_nid
+    if any(k == "fixed" for _, k in group):
+        salt = hashlib.sha1(name.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
+        nid = _make_id(plain_nid, salt)
+    else:
+        nid = _underscore_salted_nid(plain_nid, name, {plain_nid: {n for n, _ in group}})
+    if kind == "type" and (name, "method") in group:
+        tagged = f"type:{name}".encode("utf-8")
+        nid = _make_id(plain_nid, hashlib.sha1(tagged, usedforsecurity=False).hexdigest()[:6])
+    return nid
+
+
+def _swift_nested_scan(root_node, source: bytes) -> tuple[dict[str, list], dict[str, tuple[str, str]]]:
+    """Every Swift type body of a file by qualified path, and the nested declarations.
+
+    Returns ``(bodies, nested)``: ``bodies[path]`` lists the bodies that mint
+    under the type at ``path`` (its declaration and same-file extensions, by
+    the written path the walk stamps), ``nested[path] = (enclosing path, name)``
+    for each nested declaration. Function and property bodies are not entered,
+    as the class walk does not declare types there.
+    """
+    bodies: dict[str, list] = {}
+    nested: dict[str, tuple[str, str]] = {}
+
+    def _visit(node, enclosing: str | None) -> None:
+        for c in node.children:
+            if c.type in _SWIFT_NESTED_TYPE_TYPES:
+                name_node = _swift_declared_name_node(c)
+                name = _read_text(name_node, source) if name_node is not None else ""
+                if not name:
+                    continue
+                if _swift_is_extension(c):
+                    path = (
+                        _swift_user_type_name(name_node, source)
+                        if name_node.type == "user_type" else None
+                    ) or name
+                else:
+                    path = f"{enclosing}.{name}" if enclosing else name
+                    if enclosing:
+                        nested.setdefault(path, (enclosing, name))
+                body = _swift_type_body(c)
+                if body is not None:
+                    bodies.setdefault(path, []).append(body)
+                    _visit(body, path)
+            elif (c.is_named and c.type not in _SWIFT_MEMBER_FUNCTION_TYPES
+                  and c.type != "property_declaration"):
+                _visit(c, enclosing)
+
+    _visit(root_node, None)
+    return bodies, nested
 
 
 def _swift_pre_scan(root_node, source: bytes) -> tuple[set[str], set[str]]:
@@ -6087,21 +6175,45 @@ def _extract_generic(
 
     # JS/TS class body -> member collision groups, filled lazily (#4475).
     js_member_groups: dict = {}
-    # Swift (parent nid, body span) -> nested type / member collision groups,
-    # filled lazily (RFC Phase 3).
+    # Swift nested type / member ids (RFC Phase 3): the file's type bodies by
+    # qualified path, scanned once on first use; collision groups per (parent
+    # path, parent nid); the nid minted for each qualified path.
+    swift_nested_plan: list = []
     swift_nested_groups: dict = {}
+    swift_path_nids: dict[str, str] = {}
 
-    def _swift_nested_nid(parent_nid: str, decl, name: str) -> str:
+    def _swift_member_nid(parent_path: str | None, parent_nid: str, name: str,
+                          kind: str) -> str:
         plain = _make_id(parent_nid, name)
-        body = decl.parent
-        if body is None:
+        if parent_path is None:
             return plain
-        key = (parent_nid, body.start_byte, body.end_byte)
+        if not swift_nested_plan:
+            swift_nested_plan.extend(_swift_nested_scan(root, source))
+        key = (parent_path, parent_nid)
         groups = swift_nested_groups.get(key)
         if groups is None:
-            groups = _swift_nested_collision_groups(body, source, parent_nid)
+            groups = _swift_nested_collision_groups(
+                swift_nested_plan[0].get(parent_path, []), source, parent_nid
+            )
             swift_nested_groups[key] = groups
-        return _underscore_salted_nid(plain, name, groups)
+        return _swift_salted_member_nid(plain, name, kind, groups.get(plain))
+
+    def _swift_nested_path_nid(path: str) -> str | None:
+        """The nid of the nested type declared at ``path`` in this file, else None."""
+        if not swift_nested_plan:
+            swift_nested_plan.extend(_swift_nested_scan(root, source))
+        entry = swift_nested_plan[1].get(path)
+        if entry is None:
+            return None
+        if path in swift_path_nids:
+            return swift_path_nids[path]
+        enclosing, name = entry
+        parent_nid = (
+            swift_path_nids.get(enclosing)
+            or _swift_nested_path_nid(enclosing)
+            or _make_id(stem, enclosing)
+        )
+        return _swift_member_nid(enclosing, parent_nid, name, "type")
 
     python_underscore_groups: dict[str, set[str]] = {}
     if config.ts_module == "tree_sitter_python":
@@ -6313,11 +6425,27 @@ def _extract_generic(
                 class_nid = _underscore_salted_nid(class_nid, class_name, csharp_type_groups)
             if config.ts_module == "tree_sitter_python" and parent_class_nid:
                 class_nid = _make_id(parent_class_nid, class_name)
-            elif config.ts_module == "tree_sitter_swift" and parent_class_nid:
+            elif config.ts_module == "tree_sitter_swift":
                 # A nested type is held by its parent's id, so `A.State` and
                 # `B.State` of one file stay apart; salted only when a sibling
-                # type or member slugs to the same id (RFC Phase 3).
-                class_nid = _swift_nested_nid(parent_class_nid, node, class_name)
+                # type or member slugs to the same id (RFC Phase 3). A same-file
+                # extension of a nested type takes that type's real id.
+                if _swift_is_extension(node):
+                    _ext_path = (
+                        _swift_user_type_name(name_node, source)
+                        if name_node is not None and name_node.type == "user_type"
+                        else None
+                    ) or class_name
+                    class_nid = _swift_nested_path_nid(_ext_path) or class_nid
+                elif parent_class_nid:
+                    _parent_path = swift_scope_stack[-1] if swift_scope_stack else None
+                    class_nid = _swift_member_nid(
+                        _parent_path, parent_class_nid, class_name, "type"
+                    )
+                    if _parent_path is not None:
+                        swift_path_nids.setdefault(f"{_parent_path}.{class_name}", class_nid)
+                else:
+                    swift_path_nids.setdefault(class_name, class_nid)
             elif config.ts_module == "tree_sitter_python":
                 # `Session` / `session()`, `Foo` / `FOO` in one module (#2810).
                 class_nid = _underscore_salted_nid(class_nid, class_name, python_underscore_groups)
@@ -7816,7 +7944,10 @@ def _extract_generic(
                     )
                 elif config.ts_module == "tree_sitter_swift":
                     # `func state()` beside a nested `struct State` (RFC r1 F10).
-                    func_nid = _swift_nested_nid(parent_class_nid, node, sanitized_name)
+                    func_nid = _swift_member_nid(
+                        swift_scope_stack[-1] if swift_scope_stack else None,
+                        parent_class_nid, sanitized_name, "method",
+                    )
                 ruby_method_metadata = None
                 if ruby_method_kind is not None:
                     kinds = ruby_method_kinds.setdefault(func_nid, set())
