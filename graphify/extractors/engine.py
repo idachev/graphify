@@ -10136,13 +10136,16 @@ def _extract_generic(
     # properties are typed in the walk, but method-body locals were not (#1604).
     if config.ts_module == "tree_sitter_swift":
         for _caller_nid, body_node in function_bodies:
-            bound_before = set(type_table)
             _swift_local_var_types(body_node, source, type_table,
                                    factory=swift_factory_bindings)
+            # The call above skips a name already in the table (first binding
+            # wins), so collect this body's own bindings apart: every one is a
+            # write for the АР25 agreement check, skipped or not.
+            body_bindings: dict[str, str] = {}
+            _swift_local_var_types(body_node, source, body_bindings)
             body_scope = swift_body_scopes.get(id(body_node), "")
-            for local_name, local_type in type_table.items():
-                if local_name not in bound_before:
-                    _swift_set_type_scope(local_name, local_type, body_scope)
+            for local_name, local_type in body_bindings.items():
+                _swift_set_type_scope(local_name, local_type, body_scope)
 
     # JS/TS: bodies already walked with their own caller_nid (const-assigned
     # arrows, methods). An INLINE/returned arrow or function-expression that is
