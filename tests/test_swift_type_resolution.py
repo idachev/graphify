@@ -716,3 +716,42 @@ def test_bare_in_body_reference_binds_own_nested_type(tmp_path: Path):
                     and _by_id(result)[t].get("label") == "State"], (
             "a bare in-body reference must not stay on a sourceless stub"
         )
+
+
+def test_local_var_same_name_in_two_types_scope_is_none(tmp_path: Path):
+    # Decision АР25: the flat per-file table keeps one record per name. When two writes
+    # of `x` agree on the type but disagree on the scope (the enclosing type of each
+    # function), the extractor stores `scopes["x"] = None` and keeps the table value, so
+    # the corpus pass binds nothing instead of a wrong `State`.
+    path = _write(tmp_path / "src/Features.swift", (
+        "struct A {\n"
+        "    struct State {}\n"
+        "    func f() { let x = State() }\n"
+        "}\n"
+        "struct B {\n"
+        "    struct State {}\n"
+        "    func g() { let x = State() }\n"
+        "}\n"
+    ))
+    result = extract_swift(path)
+
+    assert result["swift_type_table"]["scopes"]["x"] is None
+    assert result["swift_type_table"]["table"]["x"] == "State"
+
+
+def test_property_same_name_in_two_types_scope_is_none(tmp_path: Path):
+    # Decision АР25, property flavour: `var x: State` in two sibling types.
+    path = _write(tmp_path / "src/Features.swift", (
+        "struct A {\n"
+        "    struct State {}\n"
+        "    var x: State\n"
+        "}\n"
+        "struct B {\n"
+        "    struct State {}\n"
+        "    var x: State\n"
+        "}\n"
+    ))
+    result = extract_swift(path)
+
+    assert result["swift_type_table"]["scopes"]["x"] is None
+    assert result["swift_type_table"]["table"]["x"] == "State"
