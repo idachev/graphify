@@ -83,3 +83,24 @@ node script can still be a caller or target of the Python member-call pass, as b
 **Why not here.** Accepted risk of review ЗД26 r1 F2: the earlier shebang check read files
 relative to the working directory and could drop a real Python edge on a rebuild run outside the
 scan root; a safe check needs the scan root or the detected language passed into the pass.
+
+## ТД6 Swift member calls bind a C/C++ namesake in a `.h` header
+
+**Evidence.** Pre-existing. The Swift member-call target gate in `_resolve_swift_member_calls`
+(`graphify/extract.py`, task ЗД27) admits targets from `.swift`, `.m`, `.mm` and `.h` files.
+A `.h` file can be C or C++ as well as Objective-C, so a C++ namesake passes the gate. Repro:
+a corpus with `Use.swift` containing `func useRun() { Inner.go(); Widget.render() }`, a C++
+`Inner.h` containing `class Inner { public: static void go() {} };` and an Objective-C
+`Widget.h` containing `@interface Widget - (void)render; @end`; run `extract()` over the three
+files. The Swift caller gets a `calls` edge to `.go()` in `Inner.h` (wrong) beside the correct
+edge to `-render` in `Widget.h`. Owner panel decision КН3 = B (TODO).
+
+**Why not here.** No node data tells an Objective-C `.h` from a C/C++ `.h`: nodes from both
+headers carry the same keys, and the extractor choice made in `_get_extractor` is not recorded
+in the result. The fix is a new mechanism in a second language's extractor: stamp each type
+node `extract_objc` emits (`graphify/extractors/objc.py`), keep the stamp through
+`_merge_decl_def_classes` (`graphify/extractors/resolution.py:3209`), bump `_AST_CACHE_SCHEMA`,
+and let the gate admit `.h` only with the stamp. It carries a recall risk for Swift and
+Objective-C interop (#1556), so it needs its own tests: Swift to a C++ `class Inner` in `.h`
+binds nothing, Swift to an ObjC `@interface Widget` in `.h` still binds `-render`, and a Swift
+extension folded onto an ObjC class still binds.
