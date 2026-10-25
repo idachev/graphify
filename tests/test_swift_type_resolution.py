@@ -755,3 +755,27 @@ def test_property_same_name_in_two_types_scope_is_none(tmp_path: Path):
 
     assert result["swift_type_table"]["scopes"]["x"] is None
     assert result["swift_type_table"]["table"]["x"] == "State"
+
+
+def test_shadowed_local_with_different_type_scope_is_none(tmp_path: Path):
+    # Decision АР25, same body: an outer `let x` and a shadowing `let x` in a nested
+    # block disagree on the type. The flat table keeps one record for `x`, so its
+    # scope must be None (the corpus pass then binds nothing), and the table value
+    # stays the one the walk keeps today.
+    path = _write(tmp_path / "src/Features.swift", (
+        "struct State {}\n"
+        "struct Other {}\n"
+        "struct A {\n"
+        "    func f() {\n"
+        "        let x = State()\n"
+        "        if true {\n"
+        "            let x = Other()\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = extract_swift(path)
+
+    assert result["swift_type_table"]["scopes"]["x"] is None
+    # The walk pops the later sibling first, so the nested `Other()` binding is kept.
+    assert result["swift_type_table"]["table"]["x"] == "Other"
