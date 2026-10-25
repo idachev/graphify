@@ -2,7 +2,7 @@
 
 Open points left by the Swift cross-file type resolution work
 (`docs/swift-cross-file-type-resolution-rfc.md`). Line numbers are checked against branch
-`captain/20261023-swift-xfile-types` at `e7c15c77`.
+`captain/20261023-swift-xfile-types` at `422eee02`.
 
 ## ТД1 Data loss on `graphify update` from a stem-id collision
 
@@ -11,7 +11,9 @@ unchanged file whose paths slug to the same stem (`Cfg_Helpers.swift` and `Cfg/H
 both give `cfg_helpers`) mint the same node id for a same-named declaration. When only the new
 file is re-extracted, the fresh node and the unchanged node collide in the merge, so the
 incremental graph loses a node that a full build of the same files keeps (review ЗД2 r2 F1;
-the repro below was not re-run for this note).
+the repro below was not re-run for this note). The merge appends the fresh nodes to the kept
+existing ones (`graphify/build.py:2262`) and `dedupe_nodes` keeps the last node per id
+(`graphify/build.py:892`).
 
 **Repro steps.**
 
@@ -49,8 +51,9 @@ incremental pipeline for all languages, outside the scope of a Swift resolver ch
 ## ТД3 A nested type id can equal a top-level `Outer_State` id
 
 **Evidence.** Phase 3 gives a nested type `_make_id(outer_nid, "State")`, which is the same id
-as a top-level type named `Outer_State` in the same file. The same limit exists for Python
-nested classes (review ЗД12 r1 F4).
+as a top-level type named `Outer_State` in the same file (`_swift_member_nid`,
+`graphify/extractors/engine.py:6267-6269`; `make_id` joins the parts with `_`,
+`graphify/ids.py:86`). The same limit exists for Python nested classes (review ЗД12 r1 F4).
 
 **Why not here.** The input is artificial and the fix is a change of the id scheme shared with
 Python, outside the task's scope.
@@ -61,7 +64,7 @@ Python, outside the task's scope.
 remapped to Swift with `.graphifyrc` (for example `language.swifttpl=swift`) is not treated as
 Swift there:
 
-- `graphify/extract.py:10846`, the Swift constructor-call branch in `extract()` (cited as
+- `graphify/extract.py:10864`, the Swift constructor-call branch in `extract()` (cited as
   `:10795` in review ПР8; moved on this branch).
 - `graphify/extract.py:4103`, `_swift_dotted_stub_edge` in `_rewire_unique_stub_nodes` (added
   on this branch, same pattern).
@@ -77,7 +80,7 @@ needs its own regression test with a language override.
 ## ТД5 Extensionless scripts still reach the Python member-call pass
 
 **Evidence.** `_is_python_file` in `_resolve_python_member_calls`
-(`graphify/extract.py:5168-5173`) lets a file with no suffix pass, so an extensionless bash or
+(`graphify/extract.py:5186-5191`) lets a file with no suffix pass, so an extensionless bash or
 node script can still be a caller or target of the Python member-call pass, as before the gate.
 
 **Why not here.** Accepted risk of review ЗД26 r1 F2: the earlier shebang check read files
@@ -104,3 +107,24 @@ and let the gate admit `.h` only with the stamp. It carries a recall risk for Sw
 Objective-C interop (#1556), so it needs its own tests: Swift to a C++ `class Inner` in `.h`
 binds nothing, Swift to an ObjC `@interface Widget` in `.h` still binds `-render`, and a Swift
 extension folded onto an ObjC class still binds.
+
+## ТД7 Real same-file receiver conflicts bind nothing under the flat receiver table
+
+**Evidence.** On the supacode app, five receivers are written with different types in one file
+and so get `scopes[name] = None` (АР25): `content.hibernate` (twice), `defaults.seed`,
+`nsView.update` and `state.syncGlobalDefaults`. Their member calls bind nothing, a missing edge.
+The table is flat per file: `_swift_set_type_scope` in `graphify/extractors/engine.py:6245-6253`.
+
+**Why not here.** The fix scopes receiver types by the caller function instead of by file,
+which changes the АР25 contract and the `swift_type_table` record format settled in АР3/АР12.
+
+## ТД8 The in-file Swift receiver bind matches by label only
+
+**Evidence.** Pre-existing. With a single write for a receiver (`var x: State`), the Swift
+in-file call walk (`walk_calls`, `graphify/extractors/engine.py:9174`) binds `x.go()` through
+the file's bare-label map (`label_to_nid.get(callee_name)`, `engine.py:9967`), so it can hit a
+same-named `go` of another type in the same file. The АР25 guard (`engine.py:9992-9999`) covers
+only conflicting writes.
+
+**Why not here.** Pre-existing behaviour outside the documented phases; task ЗД28 (under review)
+starts on it for agreed same-type writes, which keep only a method of that type.

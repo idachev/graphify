@@ -884,8 +884,8 @@ Full gate, per CONTRIBUTING: `uv run pytest tests -q`, `uv run ruff check .`, `u
 ## Implementation notes
 
 All five phases are implemented on `captain/20261023-swift-xfile-types`. The decisions below
-were taken during the implementation; where they differ from an earlier draft, this text and
-the fixed contracts above already follow them.
+were taken during the implementation. The fixed contracts above follow them; where a phase
+section still differs (the Phase 3 salting rule), these notes take precedence.
 
 - **АР24, same-file constructor calls (owner decision КН1).** The extractor does not bind a
   same-file constructor call whose label names a nested Swift type or a label shared by 2+
@@ -898,7 +898,11 @@ the fixed contracts above already follow them.
   (shadowed locals included), the extractor stores `scopes[name] = None`; the `table` value
   stays. `_resolve_swift_member_calls` binds nothing for such a name and does not park it, so
   the cross-repo pass cannot bind a locally declared name to a foreign type. The same holds
-  for an `"ambiguous"` lookup; only `"unresolved"` and `"external"` park.
+  for an `"ambiguous"` lookup; only `"unresolved"` and `"external"` park. Writes that name the
+  same type keep one scope, even when they differ in spelling (`Coordinator` and
+  `Outline.Coordinator`) or in enclosing scope: they keep the common enclosing path, and the
+  in-file bind then keeps only a method of that type. Only writes of different types give
+  `None` (task ЗД28).
 - **Sugar extensions.** `extension [T]`, `extension [K: V]` and `extension T?` extend
   `Swift.Array`, `Swift.Dictionary` and `Swift.Optional` (label, id and `_swift_qualified`).
   Reading the written text would slug to `T`'s own id, give `T` a second qualified path and
@@ -907,19 +911,27 @@ the fixed contracts above already follow them.
   the path `Array`.
 - **Dotted labels resolve only through `_swift_lookup`.** A dotted Swift name such as
   `CommandPaletteItem.ID` never falls back to the label key, which drops the dot and would
-  bind an unrelated `CommandPaletteItemID`. This holds for the stub rewire
-  (`_rewire_unique_stub_nodes`) and for the member-call receiver fallback; undotted names keep
-  the fallback.
+  bind an unrelated `CommandPaletteItemID`. This holds for the member-call receiver fallback
+  and for the stub rewire (`_rewire_unique_stub_nodes`); the rewire guard tests the raw `.swift`
+  suffix, so a file remapped to Swift with `.graphifyrc` is not covered yet
+  (`docs/TODO-swift-cross-file-types.md`, ТД4). Undotted names keep the fallback.
 - **No type-only edge to an extension-only node.** When a member call's receiver type is an
   extension-only node and the method is not defined in the extension, no `references` edge is
   emitted.
 - **Language gates on the member-call passes.** `_resolve_swift_member_calls` handles only
   Swift callers, decided by `effective_suffix` so a `.graphifyrc` language override counts, and
-  binds only Swift or Objective-C targets (`.swift`, `.m`, `.mm`, `.h`, for interop; the
-  target gate lands with task ЗД27).
+  binds only targets whose effective suffix is `.swift`, `.m`, `.mm` or `.h` (Objective-C
+  interop; task ЗД27). The gate is by suffix, so a C or C++ namesake in a `.h` or `.mm` file
+  still passes (ТД6).
   `_resolve_python_member_calls` handles only Python callers and binds only Python targets
   (`.py`, `.pyi`); an extensionless file is unknown and passes, as before. Edges between other
   languages come from their own passes.
+- **Nested id salting.** Phase 3 above says a single public name in a collision group keeps
+  the plain id. The code differs in two cases: an enum case or computed property always keeps
+  its plain id, so with one of them in the group every nested type and method is salted, even
+  the only public name; and a nested type and a method of the very same name (`struct State`,
+  `func State()`) get distinct ids, the type salting a kind-tagged name
+  (`_swift_salted_member_nid`, `engine.py:1503-1523`).
 - **Cache schema.** The branch bumps `_AST_CACHE_SCHEMA` once, 22 -> 23 (АР5), instead of once
   per phase.
 
