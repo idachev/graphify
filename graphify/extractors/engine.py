@@ -3058,7 +3058,8 @@ def _swift_navigation_type_head(nav_node, source: bytes) -> str | None:
     return None
 
 def _swift_local_var_types(body_node, source: bytes, table: dict[str, str],
-                           factory: dict[str, tuple[str, str]] | None = None) -> None:
+                           factory: dict[str, tuple[str, str]] | None = None,
+                           bindings: list[tuple[str, str]] | None = None) -> None:
     """Collect ``var -> Type`` from local ``let``/``var`` bindings in a Swift
     function body, so a member call on the local (``x.method()``) resolves to Type
     in the cross-file member-call pass (#1604).
@@ -3075,6 +3076,8 @@ def _swift_local_var_types(body_node, source: bytes, table: dict[str, str],
     Nested function declarations are not descended into (their locals are scoped
     away); the first binding for a name wins, so a class property of the same name
     already in the table is not overwritten.
+    When ``bindings`` is given, every typed binding the walk meets is appended to
+    it as ``(name, Type)`` before that per-name rule, shadowed ones included.
     """
     stack = [body_node]
     while stack:
@@ -3094,6 +3097,8 @@ def _swift_local_var_types(body_node, source: bytes, table: dict[str, str],
                     prop_type = _swift_navigation_type_head(child, source)
                     break
             name = _swift_property_name(n, source)
+            if bindings is not None and name and prop_type:
+                bindings.append((name, prop_type))
             if name and prop_type and name not in table:
                 table[name] = prop_type
             elif (name and factory_bind is not None and factory is not None
@@ -10229,15 +10234,15 @@ def _extract_generic(
     # properties are typed in the walk, but method-body locals were not (#1604).
     if config.ts_module == "tree_sitter_swift":
         for _caller_nid, body_node in function_bodies:
+            # The table keeps the first binding per name; every binding, the
+            # skipped and shadowed ones included, is a write for the АР25
+            # agreement check.
+            body_bindings: list[tuple[str, str]] = []
             _swift_local_var_types(body_node, source, type_table,
-                                   factory=swift_factory_bindings)
-            # The call above skips a name already in the table (first binding
-            # wins), so collect this body's own bindings apart: every one is a
-            # write for the АР25 agreement check, skipped or not.
-            body_bindings: dict[str, str] = {}
-            _swift_local_var_types(body_node, source, body_bindings)
+                                   factory=swift_factory_bindings,
+                                   bindings=body_bindings)
             body_scope = swift_body_scopes.get(id(body_node), "")
-            for local_name, local_type in body_bindings.items():
+            for local_name, local_type in body_bindings:
                 _swift_set_type_scope(local_name, local_type, body_scope)
 
     # JS/TS: bodies already walked with their own caller_nid (const-assigned
