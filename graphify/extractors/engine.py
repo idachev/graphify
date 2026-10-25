@@ -3027,6 +3027,36 @@ def _cpp_local_var_types(body_node, source: bytes, table: dict[str, str]) -> Non
         for c in n.children:
             stack.append(c)
 
+# Swift edge relations that name a type by its written path and so carry the
+# lexical scope (`_swift_scope`) the type-reference pass resolves them from.
+_SWIFT_SCOPED_RELATIONS = frozenset({"references", "inherits", "implements"})
+
+def _swift_navigation_type_head(nav_node, source: bytes) -> str | None:
+    """Return the written type path of a static-member access, or None.
+
+    ``Type.shared`` gives ``"Type"`` and ``Outer.Inner.shared`` gives
+    ``"Outer.Inner"``: everything before the last member, when every segment of
+    it is an upper-cased identifier. ``vm.shared`` and ``Type.a.b`` give None.
+    """
+    head = nav_node.children[0] if nav_node.children else None
+    segments: list[str] = []
+    while head is not None and head.type == "navigation_expression":
+        named = [c for c in head.children if c.is_named]
+        if len(named) != 2 or named[1].type != "navigation_suffix":
+            return None
+        ident = next((sc for sc in named[1].children
+                      if sc.type == "simple_identifier"), None)
+        if ident is None:
+            return None
+        segments.append(_read_text(ident, source))
+        head = named[0]
+    if head is None or head.type != "simple_identifier":
+        return None
+    segments.append(_read_text(head, source))
+    if all(seg and seg[:1].isupper() for seg in segments):
+        return ".".join(reversed(segments))
+    return None
+
 def _swift_local_var_types(body_node, source: bytes, table: dict[str, str],
                            factory: dict[str, tuple[str, str]] | None = None) -> None:
     """Collect ``var -> Type`` from local ``let``/``var`` bindings in a Swift
@@ -3061,11 +3091,7 @@ def _swift_local_var_types(body_node, source: bytes, table: dict[str, str],
                         factory_bind = _swift_factory_call(child, source)
                     break
                 if child.type == "navigation_expression":
-                    head = child.children[0] if child.children else None
-                    if head is not None and head.type == "simple_identifier":
-                        htext = _read_text(head, source)
-                        if htext and htext[:1].isupper():
-                            prop_type = htext
+                    prop_type = _swift_navigation_type_head(child, source)
                     break
             name = _swift_property_name(n, source)
             if name and prop_type and name not in table:
@@ -6011,6 +6037,31 @@ def _extract_generic(
 
     swift_protocol_names: set[str] = set()
     swift_class_names: set[str] = set()
+    # Qualified path of each enclosing Swift type (or extended type) during the
+    # walk, innermost last (`["LayoutFeature", "LayoutFeature.State"]`). A stack,
+    # not a nid -> path map: two same-named nested types can share one id, and
+    # their members must still see the path of the declaration they sit in.
+    swift_scope_stack: list[str] = []
+    # Swift function body (by id) -> the enclosing type path of its function, so
+    # the post-walk local-binding scan can scope the locals it types.
+    swift_body_scopes: dict[int, str] = {}
+    # name -> enclosing type path for the `type_table` entries, threaded out as
+    # `swift_type_table["scopes"]`; a name bound at file scope has no entry, and
+    # a name whose writes disagree on type or scope gets None (АР25).
+    swift_type_scopes: dict[str, str | None] = {}
+    # name -> (type, scope) of its first `type_table` write ("" = file scope).
+    swift_type_first_writes: dict[str, tuple[str, str]] = {}
+
+    def _swift_set_type_scope(name: str, type_name: str, scope: str) -> None:
+        # Called for every Swift `type_table[name]` write. The table is flat per
+        # file, so two writes that disagree make the name's scope unknown; the
+        # None sticks even when a later write agrees with the first one.
+        first = swift_type_first_writes.setdefault(name, (type_name, scope))
+        if first != (type_name, scope):
+            swift_type_scopes[name] = None
+        elif scope and name not in swift_type_scopes:
+            swift_type_scopes[name] = scope
+
     if config.ts_module == "tree_sitter_swift":
         swift_protocol_names, swift_class_names = _swift_pre_scan(root, source)
 
@@ -6061,6 +6112,11 @@ def _extract_generic(
             edge["context"] = context
         if metadata:
             edge["metadata"] = sanitize_metadata(metadata)
+        if (swift_scope_stack and relation in _SWIFT_SCOPED_RELATIONS
+                and config.ts_module == "tree_sitter_swift"):
+            # The type-reference pass looks the written name up from the
+            # innermost enclosing Swift type outwards; omitted at file scope.
+            edge["_swift_scope"] = swift_scope_stack[-1]
         edges.append(edge)
 
     def ensure_named_node(name: str, line: int) -> str:
@@ -6335,12 +6391,36 @@ def _extract_generic(
                 _ts_emit_decorator_edges(node, class_nid, stem, source,
                                          ensure_named_node, add_edge)
 
+            swift_path: str | None = None
             if config.ts_module == "tree_sitter_swift":
+                is_swift_extension = (
+                    t != "protocol_declaration"
+                    and any(c.type == "extension" for c in node.children)
+                )
+                if is_swift_extension:
+                    # An extension sits at file scope and names the type it
+                    # extends by its written path (`extension A.B`).
+                    swift_path = (
+                        _swift_user_type_name(name_node, source)
+                        if name_node is not None and name_node.type == "user_type"
+                        else None
+                    ) or class_name
+                elif swift_scope_stack:
+                    swift_path = f"{swift_scope_stack[-1]}.{class_name}"
+                else:
+                    swift_path = class_name
+                # One node per id: a second declaration (or a same-file
+                # extension) folding onto it adds its path once, in order.
+                swift_node = next((n for n in reversed(nodes) if n["id"] == class_nid), None)
+                if swift_node is not None:
+                    swift_qualified = swift_node.setdefault("_swift_qualified", [])
+                    if swift_path not in swift_qualified:
+                        swift_qualified.append(swift_path)
                 if t == "protocol_declaration" or _swift_declaration_keyword(node) in (
                     "class", "struct", "enum", "actor",
                 ):
                     swift_declared_nids.add(class_nid)
-                elif any(c.type == "extension" for c in node.children):
+                elif is_swift_extension:
                     # `declared` is filled in after the walk (see above).
                     swift_extensions.append(
                         {"nid": class_nid, "label": class_name, "declared": False}
@@ -7049,10 +7129,14 @@ def _extract_generic(
                 previous_singleton_depth = ruby_singleton_context_depth
                 if config.ts_module == "tree_sitter_ruby":
                     ruby_singleton_context_depth = 0
+                if swift_path is not None:
+                    swift_scope_stack.append(swift_path)
                 try:
                     for child in body.children:
                         walk(child, parent_class_nid=class_nid)
                 finally:
+                    if swift_path is not None:
+                        swift_scope_stack.pop()
                     ruby_singleton_context_depth = previous_singleton_depth
                     if config.ts_module == "tree_sitter_ruby":
                         ruby_lexical_scopes.pop()
@@ -7412,11 +7496,7 @@ def _extract_generic(
                 # is the singleton idiom (`Type.shared`) cached into a local var and
                 # called on a subsequent line — extremely common in Swift.
                 elif child.type == "navigation_expression" and prop_type is None:
-                    head = child.children[0] if child.children else None
-                    if head is not None and head.type == "simple_identifier":
-                        htext = _read_text(head, source)
-                        if htext and htext[:1].isupper():
-                            prop_type = htext
+                    prop_type = _swift_navigation_type_head(child, source)
             # #2561: `@Environment(Store.self) var store` names the property's
             # type only inside the attribute argument (modifiers > attribute),
             # which the direct-children scan above never reaches. Last resort:
@@ -7426,6 +7506,9 @@ def _extract_generic(
             prop_name = _swift_property_name(node, source)
             if prop_name and prop_type:
                 type_table[prop_name] = prop_type
+                _swift_set_type_scope(
+                    prop_name, prop_type, swift_scope_stack[-1] if swift_scope_stack else "",
+                )
             elif (prop_name and pending_factory is not None
                   and prop_name not in swift_factory_bindings):
                 swift_factory_bindings[prop_name] = pending_factory
@@ -7444,6 +7527,8 @@ def _extract_generic(
                 add_node(prop_nid, f".{prop_name}", line)
                 add_edge(parent_class_nid, prop_nid, "method", line)
                 for body_block in comp_bodies:
+                    if swift_scope_stack:
+                        swift_body_scopes[id(body_block)] = swift_scope_stack[-1]
                     function_bodies.append((prop_nid, body_block))
             return
 
@@ -7954,6 +8039,10 @@ def _extract_generic(
                         pname = _read_text(name_node, source) if name_node else None
                         if pname:
                             type_table[pname] = param_type
+                            _swift_set_type_scope(
+                                pname, param_type,
+                                swift_scope_stack[-1] if swift_scope_stack else "",
+                            )
                 return_node = node.child_by_field_name("return_type")
                 if return_node is not None:
                     refs = []
@@ -8119,6 +8208,8 @@ def _extract_generic(
                     java_method_scopes[id(body)] = (node, parent_class_nid)
                 if config.ts_module == "tree_sitter_c_sharp" and parent_class_nid:
                     csharp_method_scopes[id(body)] = (node, parent_class_nid)
+                if config.ts_module == "tree_sitter_swift" and swift_scope_stack:
+                    swift_body_scopes[id(body)] = swift_scope_stack[-1]
                 function_bodies.append((func_nid, body))
                 if config.ts_module in (
                     "tree_sitter_javascript", "tree_sitter_typescript"
@@ -10140,6 +10231,14 @@ def _extract_generic(
         for _caller_nid, body_node in function_bodies:
             _swift_local_var_types(body_node, source, type_table,
                                    factory=swift_factory_bindings)
+            # The call above skips a name already in the table (first binding
+            # wins), so collect this body's own bindings apart: every one is a
+            # write for the АР25 agreement check, skipped or not.
+            body_bindings: dict[str, str] = {}
+            _swift_local_var_types(body_node, source, body_bindings)
+            body_scope = swift_body_scopes.get(id(body_node), "")
+            for local_name, local_type in body_bindings.items():
+                _swift_set_type_scope(local_name, local_type, body_scope)
 
     # JS/TS: bodies already walked with their own caller_nid (const-assigned
     # arrows, methods). An INLINE/returned arrow or function-expression that is
@@ -10359,7 +10458,9 @@ def _extract_generic(
         _php_receiver_type_table(root, source, type_table)
     if config.ts_module == "tree_sitter_swift":
         if type_table or swift_factory_bindings:
-            result["swift_type_table"] = {"path": str_path, "table": type_table}
+            result["swift_type_table"] = {
+                "path": str_path, "table": type_table, "scopes": swift_type_scopes,
+            }
             if swift_factory_bindings:
                 # Lists, not tuples: the value must round-trip the JSON AST cache.
                 result["swift_type_table"]["factory"] = {
