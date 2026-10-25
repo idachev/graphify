@@ -4903,6 +4903,11 @@ def _resolve_swift_member_calls(
                 node_by_id.get(caller), callee, type_name, "swift", rc,
             )
             continue
+        elif is_swift_call and "." in type_name:
+            # A dotted Swift name resolves only through `_swift_lookup`: the
+            # `_key` strip would turn `CommandPaletteItem.ID` into the unrelated
+            # `CommandPaletteItemID`. Unbound, it parks like any unknown type.
+            type_defs = []
         else:
             type_defs = type_def_nids.get(_key(type_name), [])
         if not type_defs:
@@ -4920,6 +4925,12 @@ def _resolve_swift_member_calls(
             continue
         type_nid = type_defs[0]
         method_nid = method_index.get((type_nid, _key(callee)))
+        # An extension-only node is not a declaration of its type (`extension
+        # NSEvent {}`, or an extension of a type declared nowhere here): a
+        # type-only `references` edge to it is a wrong binding, so emit none.
+        # A method defined in that extension is a real target and keeps `calls`.
+        if method_nid is None and (node_by_id.get(type_nid) or {}).get("_swift_extension_only"):
+            continue
         target = method_nid or type_nid
         relation = "calls" if method_nid else "references"
         if target == caller or (caller, target) in existing_pairs:
