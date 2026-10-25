@@ -1406,6 +1406,31 @@ def _swift_is_extension(decl) -> bool:
     )
 
 
+# `extension [T]`, `extension [K: V]` and `extension T?` extend the standard
+# generic behind the sugar, an external type. Reading the name node's text
+# (`[T]`) would slug to T's own id and stamp a second path on T. The sugar
+# always means the standard library type, so the target carries its `Swift.`
+# path: a project's own `struct Array` must not take the extension.
+_SWIFT_SUGAR_EXTENSION_TARGETS = {
+    "array_type": "Swift.Array",
+    "dictionary_type": "Swift.Dictionary",
+    "optional_type": "Swift.Optional",
+}
+
+
+def _swift_extension_path(name_node, source: bytes) -> str:
+    """The written path of the type a Swift extension extends.
+
+    `extension A.B` gives `"A.B"`, `extension Array<T>` gives `"Array"`, and
+    the sugar forms give their standard generic (`[T]` gives `"Swift.Array"`).
+    """
+    if name_node.type == "user_type":
+        path = _swift_user_type_name(name_node, source)
+        if path:
+            return path
+    return _SWIFT_SUGAR_EXTENSION_TARGETS.get(name_node.type) or _read_text(name_node, source)
+
+
 def _swift_type_body(decl):
     body = decl.child_by_field_name("body")
     if body is not None:
@@ -1519,8 +1544,8 @@ def _swift_nested_scan(root_node, source: bytes) -> tuple[dict[str, list], dict[
                     continue
                 if _swift_is_extension(c):
                     path = (
-                        _swift_user_type_name(name_node, source)
-                        if name_node is not None and name_node.type == "user_type"
+                        _swift_extension_path(name_node, source)
+                        if name_node is not None
                         else None
                     ) or name
                 else:
@@ -6454,6 +6479,11 @@ def _extract_generic(
                 if not synthetic_name:
                     return
             class_name = synthetic_name if synthetic_name else _read_text(name_node, source)
+            if (config.ts_module == "tree_sitter_swift" and name_node is not None
+                    and _swift_is_extension(node)):
+                # `extension [T]` / `extension T?` extend Swift.Array /
+                # Swift.Optional, not T: label, id and path name the stdlib type.
+                class_name = _SWIFT_SUGAR_EXTENSION_TARGETS.get(name_node.type, class_name)
             ruby_absolute_declaration = (
                 config.ts_module == "tree_sitter_ruby" and class_name.startswith("::")
             )
@@ -6489,9 +6519,8 @@ def _extract_generic(
                 # extension of a nested type takes that type's real id.
                 if _swift_is_extension(node):
                     _ext_path = (
-                        _swift_user_type_name(name_node, source)
-                        if name_node is not None and name_node.type == "user_type"
-                        else None
+                        _swift_extension_path(name_node, source)
+                        if name_node is not None else None
                     ) or class_name
                     class_nid = _swift_nested_path_nid(_ext_path) or class_nid
                 elif parent_class_nid:
@@ -6626,9 +6655,8 @@ def _extract_generic(
                     # An extension sits at file scope and names the type it
                     # extends by its written path (`extension A.B`).
                     swift_path = (
-                        _swift_user_type_name(name_node, source)
-                        if name_node is not None and name_node.type == "user_type"
-                        else None
+                        _swift_extension_path(name_node, source)
+                        if name_node is not None else None
                     ) or class_name
                 elif swift_scope_stack:
                     swift_path = f"{swift_scope_stack[-1]}.{class_name}"
