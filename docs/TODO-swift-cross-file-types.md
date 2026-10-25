@@ -145,11 +145,35 @@ A fix exists on the local branch `captain/20261023-swift-xfile-types-zd28` (head
 not pushed). Its closed fail-closed rule (panel КН4) treats two writes as one type only when
 that is proven: the type is a struct, enum, protocol, actor or a class without an inheritance
 clause, every prefix of the path is declared in the file, and no base-class lookup is needed.
-It restores 8 of the 21 calls. Its last fix (r3 F1, prefix kind check, `f98dde7a`) is
-unreviewed. 5 of the 21 are real conflicts, written with different types (`content.hibernate`
-twice, `defaults.seed`, `nsView.update`, `state.syncGlobalDefaults`); they need receiver types
-scoped by the caller function, a change of the АР25 contract and of the `swift_type_table`
-record format settled in АР3/АР12.
+It restores 8 of the 21 calls. 5 of the 21 are real conflicts, written with different types
+(`content.hibernate` twice, `defaults.seed`, `nsView.update`, `state.syncGlobalDefaults`); they
+need receiver types scoped by the caller function, a change of the АР25 contract and of the
+`swift_type_table` record format settled in АР3/АР12.
 
-**Why not here.** The ЗД28 review loop reached its bound of three re-reviews, and each round
-found new holes (4, then 2, then 1), so the refinement was not merged.
+A fourth review of `f98dde7a` found three more inputs where the branch binds a call to a
+different type than the receiver's, while this branch binds nothing (each reproduced with
+`extract()` on both commits):
+
+- F1, qualified typealias: `struct Other { func go() {} }; struct Box { struct State { func go() {} } };
+  struct A { struct Box { typealias State = Other }; func a(_ x: Box.State) { x.go() } };
+  struct B { func b(_ x: Box.State) { x.go() } }` binds `A.a` to the global `Box.State.go`.
+  Only the first segment of the path is checked for a typealias.
+- F2, associated type: `protocol P { func go() }; struct State { func go() {} };
+  protocol A { associatedtype State: P }; extension A { func a(_ x: State) { x.go() } };
+  struct B { func b(_ x: State) { x.go() } }` binds `A.a` to the global `State.go`.
+- H2, local type: a `struct State` declared inside a function body binds to the global `State`.
+
+The cause is an open deny-list: the proof rejects only a typealias or a generic parameter on the
+first segment, so every other declaration kind and every later segment passes. A closed rule
+would fix all three: a write is unproven when any segment of its type is bound by anything other
+than a non-local struct, enum, protocol, actor or class declared in the file (typealias,
+associatedtype, generic parameters of types, functions, initializers, subscripts, macros and
+generic typealiases, parameter packs, local types). A simulation of that rule kept the 8
+restored calls on the real app (951 of 951 edges on 13 copied files). Three older holes exist
+on both commits and are not covered by it: `Self.State`, `<Box: Q> Box.State`, and
+`A<State>` with `State?`.
+
+**Why not here.** Each review round of ЗД28 found new holes in the same proof check (4, 2, 1,
+then 2 plus one found while checking them), and a wrong edge is worse than a missing one. Panel
+decision КН7 = B (3 of 3): keep the branch unmerged and ship fail-closed. The closed rule above,
+or the caller-scoped receiver table, is a separate piece of work with its own review loop.
