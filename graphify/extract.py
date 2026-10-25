@@ -3905,6 +3905,9 @@ def _node_label_key(node: dict, fold: bool = False) -> str:
     # `_Response` must not share a key with an external `Response` and absorb its
     # reference during stub rewiring (#4269). Only drop call/generic punctuation
     # (`()`, `<>`, `.`, whitespace) so `Foo()` and `Foo` still match.
+    # Dropping `.` makes a dotted Swift stub (`Item.ID`) share a key with a
+    # concatenated name (`ItemID`); the rewire edge loop refuses that match per
+    # edge (`_swift_dotted_stub_edge`), since only `_swift_lookup` binds them.
     key = re.sub(r"[^a-zA-Z0-9_]+", "", label)
     return key.lower() if fold else key
 
@@ -4088,13 +4091,27 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
             and edge_fam != cand_fam
         )
 
+    def _swift_dotted_stub_edge(edge: dict, stub_id: str) -> bool:
+        """A Swift edge on a dotted stub (`CommandPaletteItem.ID`) keeps its stub.
+
+        The label key drops the dot, so the stub would bind an unrelated
+        `CommandPaletteItemID`. A dotted Swift name binds only through
+        `_swift_lookup` (the Swift type-reference pass); what that pass left on
+        the stub stays there. Method-shaped `.foo()` stubs and edges from other
+        languages keep the label-key match.
+        """
+        if not str(edge.get("source_file") or "").lower().endswith(".swift"):
+            return False
+        label = str(by_id.get(stub_id, {}).get("label", "")).strip().lstrip(".")
+        return "." in label
+
     for edge in edges:
         is_csharp_scoped_edge = (
             _is_dotnet_source_file(str(edge.get("source_file", "")))
             and edge.get("relation") in csharp_scoped_relations
         )
         source = edge.get("source")
-        if source in remap:
+        if source in remap and not _swift_dotted_stub_edge(edge, str(source)):
             remapped_source = remap[str(source)]
             if not (
                 is_csharp_scoped_edge
@@ -4104,7 +4121,11 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
         target = edge.get("target")
         # A Swift edge the Swift lookup declined (ambiguous / unresolved) stays
         # on its stub: a bare label may not mean the one same-named nested type.
-        if target in remap and not edge.get("_swift_lookup"):
+        if (
+            target in remap
+            and not edge.get("_swift_lookup")
+            and not _swift_dotted_stub_edge(edge, str(target))
+        ):
             remapped_target = remap[str(target)]
             if not (
                 is_csharp_scoped_edge
