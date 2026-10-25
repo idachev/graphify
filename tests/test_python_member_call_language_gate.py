@@ -79,6 +79,11 @@ def test_python_caller_still_binds_python_class():
     assert edges[0]["confidence"] == "EXTRACTED"
 
 
+def test_extensionless_caller_still_binds_python_class():
+    # A shebang script has no suffix; its language is unknown here, so it passes.
+    assert len(_resolve("bin/tool", "Inner", "lib.py")) == 1
+
+
 def _calls(result):
     nodes = {n["id"]: n for n in result["nodes"]}
     return {(nodes[e["source"]].get("label"), nodes[e["source"]].get("source_file"),

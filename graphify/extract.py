@@ -5165,27 +5165,12 @@ def _resolve_python_member_calls(
             parent = nid = up
         return None
 
-    python_file_by_path: dict[str, bool] = {}
-
     def _is_python_file(source_file: object) -> bool:
         # The effective suffix honours a `.graphifyrc` language override. An
-        # extensionless file reached extraction through its shebang, so read it
-        # the same way _get_extractor does; an unreadable one keeps the old
-        # behaviour, as does a raw call that names no file.
-        key = str(source_file or "")
-        known = python_file_by_path.get(key)
-        if known is None:
-            suffix = effective_suffix(key).lower() if key else ""
-            if suffix:
-                known = suffix in (".py", ".pyi")
-            elif key:
-                from graphify.detect import _shebang_interpreter
-                interp = _shebang_interpreter(Path(key))
-                known = interp is None or _SHEBANG_DISPATCH.get(interp) is extract_python
-            else:
-                known = True
-            python_file_by_path[key] = known
-        return known
+        # extensionless file (a shebang script) or a raw call that names no file
+        # is unknown and passes, as before the gate.
+        suffix = effective_suffix(str(source_file or "")).lower()
+        return not suffix or suffix in (".py", ".pyi")
 
     def _emit_call(
         caller: str, target_nid: "str | None", rc: dict, inferred: bool = False
