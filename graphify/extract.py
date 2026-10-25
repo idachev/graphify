@@ -4708,6 +4708,8 @@ def _resolve_swift_member_calls(
                     or (path, receiver) in factory_typed):
                 continue
             scope = scopes.get(receiver, "")
+            if scope is None:  # conflicting writes in the file (АР25)
+                continue
             if _swift_lookup(swift_index, type_name, scope)[0] == "resolved":
                 continue
             factory_type, factory_method = type_name.rsplit(".", 1)
@@ -4760,9 +4762,15 @@ def _resolve_swift_member_calls(
         else:
             type_name = type_table_by_file.get(call_file, {}).get(receiver)
             type_qualified = False
-            factory_nid = factory_typed.get((call_file, receiver))
-            if factory_nid is None:
-                type_scope = scopes_by_file.get(call_file, {}).get(receiver, "")
+            file_scopes = scopes_by_file.get(call_file, {})
+            if receiver in file_scopes and file_scopes[receiver] is None:
+                # Two writes of this name in the file disagree on type or
+                # scope (АР25): bind nothing, park below as unresolved.
+                type_scope = None
+            else:
+                factory_nid = factory_typed.get((call_file, receiver))
+                if factory_nid is None:
+                    type_scope = file_scopes.get(receiver, "")
         if not type_name:
             continue
         # A builtin receiver type (Data, NSLock, DispatchQueue, ...) must not

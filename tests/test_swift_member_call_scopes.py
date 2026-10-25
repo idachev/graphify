@@ -230,3 +230,37 @@ def test_factory_return_nested_type_with_top_level_namesake_binds(tmp_path: Path
     assert len(nested_go) == 1
     assert nested_go[0] in targets
     assert not set(_nodes_by_file(result, top, ".go()")) & targets
+
+
+def test_member_call_same_param_name_in_two_types_binds_nothing(tmp_path: Path):
+    # `x` names a different nested `State` in each type of one file; the flat
+    # per-file table cannot tell them apart (АР25), so neither call binds.
+    base = tmp_path / "src"
+    views = _write(base / "Views.swift", (
+        "struct A {\n"
+        "    struct State {\n"
+        "        func go() {}\n"
+        "    }\n"
+        "    var x: State\n\n"
+        "    func run() {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+        "struct B {\n"
+        "    struct State {\n"
+        "        func go() {}\n"
+        "    }\n"
+        "    var x: State\n\n"
+        "    func run() {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([views], tmp_path)
+
+    go_nids = set(_nodes_by_file(result, views, ".go()"))
+    run_nids = _nodes_by_file(result, views, ".run()")
+    assert len(go_nids) == 2
+    assert len(run_nids) == 2
+    for run_nid in run_nids:
+        assert not _call_targets(result, run_nid) & go_nids
