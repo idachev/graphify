@@ -4822,7 +4822,8 @@ def _resolve_swift_member_calls(
         # (Type.staticMethod(), Singleton.shared.x()); otherwise look it up in the
         # declaring file's local type table.
         call_file = rc.get("source_file", "")
-        is_swift_call = str(call_file).lower().endswith(".swift")
+        # The effective suffix honours a `.graphifyrc` language override.
+        is_swift_call = effective_suffix(call_file).lower() == ".swift"
         if not is_swift_call:
             # Swift callers only: a Ruby `Inner.go()` must not bind a Swift-only
             # `Inner`; other languages bind their member calls in their own passes.
@@ -4889,7 +4890,7 @@ def _resolve_swift_member_calls(
             # (#3152). This resolver shares `all_raw_calls` with every other
             # language and Swift raw_calls carry no `lang` tag, so the parked
             # entry's language comes from the declaring file's suffix.
-            if str(rc.get("source_file", "")).lower().endswith(".swift"):
+            if is_swift_call:
                 _park_unresolved_member_call(
                     node_by_id.get(caller), callee, type_name, "swift", rc,
                 )

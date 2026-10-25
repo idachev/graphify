@@ -418,3 +418,25 @@ def test_ruby_call_does_not_bind_swift_type_when_a_swift_type_table_exists(tmp_p
         and e.get("target") in swift_go
         for e in result["edges"]
     )
+
+
+def test_member_call_in_language_override_swift_file_binds(tmp_path: Path):
+    # `.graphifyrc` `language.swifttpl=swift`: a remapped file is a Swift caller,
+    # so its typed member call binds like one in a `.swift` file (gt1 r2 F2).
+    base = tmp_path / "src"
+    _write(base / ".graphifyrc", "language.swifttpl=swift\n")
+    inner = _write(base / "Inner.swift", "class Inner { static func go() {} }\n")
+    use = _write(base / "Use.swifttpl", (
+        "class Holder {\n"
+        "    let inner: Inner = Inner()\n"
+        "    func run() {\n"
+        "        inner.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([inner, use], tmp_path)
+
+    run_nids = _nodes_by_file(result, use, ".run()")
+    assert len(run_nids) == 1
+    go_nids = set(_nodes_by_file(result, inner, ".go()"))
+    assert go_nids and go_nids <= _call_targets(result, run_nids[0])
