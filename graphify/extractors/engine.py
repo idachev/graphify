@@ -1593,6 +1593,9 @@ def _swift_type_facts(root_node, source: bytes) -> tuple[set[str], set[str], set
                 else:
                     path = f"{enclosing}.{name}" if enclosing else name
                     declared.add(path)
+                    # КН4 A: only a class can inherit nested types. A struct,
+                    # enum, protocol or actor (an actor inherits no class) may
+                    # conform to protocols, which cannot nest types.
                     if (any(x.type == "class" for x in c.children)
                             and any(x.type == "inheritance_specifier" for x in c.children)):
                         inheriting.add(path)
@@ -6308,7 +6311,9 @@ def _extract_generic(
                 return True
             for i in range(1, len(segments) + 1):
                 prefix = ".".join(([level] if level else []) + segments[:i])
-                if prefix not in declared and (prefix in known or not level):
+                if prefix in inheriting or (
+                    prefix not in declared and (prefix in known or not level)
+                ):
                     return True
             return False
 

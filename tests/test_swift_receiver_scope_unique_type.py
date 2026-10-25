@@ -338,3 +338,37 @@ def test_r2_subclass_of_external_class_is_unproven(tmp_path: Path):
         "}\n"
     ))
     assert extract_swift(path)["swift_type_table"]["scopes"]["coordinator"] is None
+
+
+# ── ЗД28 review round 3 ───────────────────────────────────────────────────────
+
+def test_r3_f1_inheriting_class_as_candidate_prefix_binds_nothing(tmp_path: Path):
+    # `Box.State` inside A means A.Box (a subclass of Base) -> Base.State, not the
+    # global Box.State: a candidate prefix that is a class with an inheritance
+    # clause makes the write unproven.
+    path = _write(tmp_path / "src/M.swift", (
+        "struct Box { struct State { func go() {} } }\n"
+        "class Base { struct State { func go() {} } }\n"
+        "struct A {\n"
+        "    class Box: Base {}\n"
+        "    func a(_ x: Box.State) { x.go() }\n"
+        "}\n"
+        "struct B { func b(_ x: Box.State) { x.go() } }\n"
+    ))
+    scope, calls = _scope_and_calls(path, tmp_path, ".a()", ".go()")
+    assert scope is None
+    assert calls == set()
+
+
+def test_r3_f2_actor_with_conformance_is_a_proven_level(tmp_path: Path):
+    # An actor inherits no class; a protocol conformance cannot nest types, so an
+    # actor level is proven like a struct (КН4 A, explicit).
+    path = _write(tmp_path / "src/M.swift", (
+        "protocol Sendable2 {}\n"
+        "final class Model { func go() {} }\n"
+        "actor Worker: Sendable2 { func a(_ x: Model) { x.go() } }\n"
+        "struct Panel { func b(_ x: Model) { x.go() } }\n"
+    ))
+    scope, calls = _scope_and_calls(path, tmp_path, ".a()", ".go()")
+    assert scope == "<none>"
+    assert calls == {"Model"}
