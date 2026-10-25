@@ -99,12 +99,14 @@ MAIN = "from lib import Inner\n\ndef use():\n    return Inner.go()\n"
 def test_python_to_python_member_call_binds_in_mixed_corpus(tmp_path):
     (tmp_path / "lib.py").write_text(LIB)
     (tmp_path / "main.py").write_text(MAIN)
-    (tmp_path / "inner.swift").write_text("class Inner {\n    static func go() {}\n}\n")
-    (tmp_path / "use.py").write_text("def run():\n    Inner.go()\n")
-    paths = [tmp_path / name for name in ("lib.py", "main.py", "inner.swift", "use.py")]
+    # A distinct Swift class name: a second `Inner` would trip the pass's
+    # single-definition guard and drop the Python edge, as before the gate.
+    (tmp_path / "widget.swift").write_text("class Widget {\n    static func go() {}\n}\n")
+    (tmp_path / "use.py").write_text("def run():\n    Widget.go()\n")
+    paths = [tmp_path / name for name in ("lib.py", "main.py", "widget.swift", "use.py")]
     calls = _calls(extract(paths, root=tmp_path, cache_root=tmp_path))
     assert ("use()", "main.py", ".go()", "lib.py") in calls
-    assert not any(src == "use.py" and dst == "inner.swift" for _, src, _, dst in calls)
+    assert not any(src == "use.py" and dst == "widget.swift" for _, src, _, dst in calls)
 
 
 def test_file_mapped_to_python_by_graphifyrc_still_binds(tmp_path):
