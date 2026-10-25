@@ -4899,6 +4899,12 @@ def _resolve_swift_member_calls(
             continue
         type_nid = type_defs[0]
         method_nid = method_index.get((type_nid, _key(callee)))
+        # An extension-only node is not a declaration of its type (`extension
+        # NSEvent {}`, or an extension of a type declared nowhere here): a
+        # type-only `references` edge to it is a wrong binding, so emit none.
+        # A method defined in that extension is a real target and keeps `calls`.
+        if method_nid is None and (node_by_id.get(type_nid) or {}).get("_swift_extension_only"):
+            continue
         target = method_nid or type_nid
         relation = "calls" if method_nid else "references"
         if target == caller or (caller, target) in existing_pairs:
