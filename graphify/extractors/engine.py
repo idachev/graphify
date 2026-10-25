@@ -6000,16 +6000,21 @@ def _extract_generic(
     # the post-walk local-binding scan can scope the locals it types.
     swift_body_scopes: dict[int, str] = {}
     # name -> enclosing type path for the `type_table` entries, threaded out as
-    # `swift_type_table["scopes"]`; a name bound at file scope has no entry.
-    swift_type_scopes: dict[str, str] = {}
+    # `swift_type_table["scopes"]`; a name bound at file scope has no entry, and
+    # a name whose writes disagree on type or scope gets None (АР25).
+    swift_type_scopes: dict[str, str | None] = {}
+    # name -> (type, scope) of its first `type_table` write ("" = file scope).
+    swift_type_first_writes: dict[str, tuple[str, str]] = {}
 
-    def _swift_set_type_scope(name: str) -> None:
-        # Keep `scopes` in step with the `type_table[name]` just written: a
-        # later file-scope binding of the same name drops the earlier scope.
-        if swift_scope_stack:
-            swift_type_scopes[name] = swift_scope_stack[-1]
-        else:
-            swift_type_scopes.pop(name, None)
+    def _swift_set_type_scope(name: str, type_name: str, scope: str) -> None:
+        # Called for every Swift `type_table[name]` write. The table is flat per
+        # file, so two writes that disagree make the name's scope unknown; the
+        # None sticks even when a later write agrees with the first one.
+        first = swift_type_first_writes.setdefault(name, (type_name, scope))
+        if first != (type_name, scope):
+            swift_type_scopes[name] = None
+        elif scope and name not in swift_type_scopes:
+            swift_type_scopes[name] = scope
 
     if config.ts_module == "tree_sitter_swift":
         swift_protocol_names, swift_class_names = _swift_pre_scan(root, source)
@@ -7455,7 +7460,9 @@ def _extract_generic(
             prop_name = _swift_property_name(node, source)
             if prop_name and prop_type:
                 type_table[prop_name] = prop_type
-                _swift_set_type_scope(prop_name)
+                _swift_set_type_scope(
+                    prop_name, prop_type, swift_scope_stack[-1] if swift_scope_stack else "",
+                )
             elif (prop_name and pending_factory is not None
                   and prop_name not in swift_factory_bindings):
                 swift_factory_bindings[prop_name] = pending_factory
@@ -7986,7 +7993,10 @@ def _extract_generic(
                         pname = _read_text(name_node, source) if name_node else None
                         if pname:
                             type_table[pname] = param_type
-                            _swift_set_type_scope(pname)
+                            _swift_set_type_scope(
+                                pname, param_type,
+                                swift_scope_stack[-1] if swift_scope_stack else "",
+                            )
                 return_node = node.child_by_field_name("return_type")
                 if return_node is not None:
                     refs = []
@@ -10129,11 +10139,10 @@ def _extract_generic(
             bound_before = set(type_table)
             _swift_local_var_types(body_node, source, type_table,
                                    factory=swift_factory_bindings)
-            body_scope = swift_body_scopes.get(id(body_node))
-            if body_scope:
-                for local_name in type_table:
-                    if local_name not in bound_before:
-                        swift_type_scopes[local_name] = body_scope
+            body_scope = swift_body_scopes.get(id(body_node), "")
+            for local_name, local_type in type_table.items():
+                if local_name not in bound_before:
+                    _swift_set_type_scope(local_name, local_type, body_scope)
 
     # JS/TS: bodies already walked with their own caller_nid (const-assigned
     # arrows, methods). An INLINE/returned arrow or function-expression that is
