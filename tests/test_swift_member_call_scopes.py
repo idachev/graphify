@@ -298,9 +298,9 @@ def test_dotted_typealias_annotation_does_not_bind_case_folded_factory(tmp_path:
     assert not _call_targets(result, run_nids[0]) & go_nids
 
 
-def test_factory_methods_differing_in_case_bind_the_exact_one(tmp_path: Path):
-    # `Make()` and `make()` fold to one `method_index` key; the factory binds
-    # by the exact label, whatever the edge order.
+def test_factory_methods_differing_in_case_bind_nothing(tmp_path: Path):
+    # Node ids are caseless, so `Make()` and `make()` of one type are one node
+    # with two return types: the factory binds neither, whatever the edge order.
     base = tmp_path / "src"
     widget = _write(base / "Widget.swift", "class Widget {\n    func go() {}\n}\n")
     other = _write(base / "Other.swift", "class Other {\n    func go() {}\n}\n")
@@ -327,10 +327,10 @@ def test_factory_methods_differing_in_case_bind_the_exact_one(tmp_path: Path):
     run_nids = _nodes_by_file(result, consumer, ".run()")
     assert len(run_nids) == 1
     targets = _call_targets(result, run_nids[0])
-    widget_go = _nodes_by_file(result, widget, ".go()")
-    assert len(widget_go) == 1
-    assert widget_go[0] in targets
-    assert not set(_nodes_by_file(result, other, ".go()")) & targets
+    go_nids = (set(_nodes_by_file(result, widget, ".go()"))
+               | set(_nodes_by_file(result, other, ".go()")))
+    assert len(go_nids) == 2
+    assert not go_nids & targets
 
 
 def test_conflicting_scope_member_call_not_parked_for_cross_repo(tmp_path: Path):
