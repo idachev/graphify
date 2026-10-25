@@ -4687,13 +4687,27 @@ def _resolve_swift_member_calls(
     # nodes keeps that shadow from making a real type name look ambiguous.
     contained = {e.get("target") for e in all_edges if e.get("relation") == "contains"}
 
-    # Type name -> definition node ids (real, source-backed, type-like defs only).
-    # len != 1 is the god-node guard: an ambiguous type name bails.
+    # A Swift call binds only a target Swift can call: a Swift declaration or an
+    # Objective-C one (Swift<->ObjC interop, #1556: an ObjC class, and a Swift
+    # extension folded onto it, are called from Swift). A Python `Inner.go()`
+    # is never a Swift target. The language comes from the node's file through
+    # `effective_suffix`, so a `.graphifyrc` remap to Swift counts as Swift.
+    swift_target_suffixes = frozenset({".swift", ".m", ".mm", ".h"})
+
+    def _is_swift_target(node: dict | None) -> bool:
+        source_file = (node or {}).get("source_file") or ""
+        return effective_suffix(source_file).lower() in swift_target_suffixes
+
+    # Type name -> definition node ids (real, source-backed, type-like defs only,
+    # Swift targets only: a same-named type in another language is neither a
+    # candidate nor a rival). len != 1 is the god-node guard: an ambiguous type
+    # name bails. No Swift candidate parks the call like an unknown type below.
     type_def_nids: dict[str, list[str]] = {}
     node_by_id: dict[str, dict] = {}
     for n in all_nodes:
         node_by_id[n.get("id")] = n
-        if n.get("source_file") and n.get("id") in contained and _is_type_like_definition(n):
+        if (n.get("source_file") and n.get("id") in contained
+                and _is_type_like_definition(n) and _is_swift_target(n)):
             type_def_nids.setdefault(_key(n.get("label", "")), []).append(n["id"])
 
     # (type_node_id, method_key) -> method_node_id, from `method` edges.
@@ -4933,6 +4947,10 @@ def _resolve_swift_member_calls(
             continue
         target = method_nid or type_nid
         relation = "calls" if method_nid else "references"
+        if not _is_swift_target(node_by_id.get(target)):
+            # The type is a Swift target, but the method edge points into
+            # another language: bind nothing rather than cross languages.
+            continue
         if target == caller or (caller, target) in existing_pairs:
             continue
         existing_pairs.add((caller, target))
