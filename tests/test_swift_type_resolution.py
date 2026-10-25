@@ -754,3 +754,4 @@ def test_property_same_name_in_two_types_scope_is_none(tmp_path: Path):
     result = extract_swift(path)
 
     assert result["swift_type_table"]["scopes"]["x"] is None
+    assert result["swift_type_table"]["table"]["x"] == "State"
