@@ -264,3 +264,70 @@ def test_member_call_same_param_name_in_two_types_binds_nothing(tmp_path: Path):
     assert len(run_nids) == 2
     for run_nid in run_nids:
         assert not _call_targets(result, run_nid) & go_nids
+
+
+def test_dotted_typealias_annotation_does_not_bind_case_folded_factory(tmp_path: Path):
+    # `x: Factory.Make` names a typealias (no node), so the dotted retry tries
+    # factory `Factory`, method `Make`; only `make()` exists, which must not match.
+    base = tmp_path / "src"
+    types = _write(base / "Types.swift", (
+        "class Widget {\n"
+        "    func go() {}\n"
+        "}\n"
+        "struct Factory {\n"
+        "    typealias Make = Int\n"
+        "    static func make() -> Widget {\n"
+        "        return Widget()\n"
+        "    }\n"
+        "}\n"
+    ))
+    consumer = _write(base / "Consumer.swift", (
+        "class Consumer {\n"
+        "    var x: Factory.Make\n\n"
+        "    func run() {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([types, consumer], tmp_path)
+
+    run_nids = _nodes_by_file(result, consumer, ".run()")
+    assert len(run_nids) == 1
+    go_nids = set(_nodes_by_file(result, types, ".go()"))
+    assert len(go_nids) == 1
+    assert not _call_targets(result, run_nids[0]) & go_nids
+
+
+def test_factory_methods_differing_in_case_bind_the_exact_one(tmp_path: Path):
+    # `Make()` and `make()` fold to one `method_index` key; the factory binds
+    # by the exact label, whatever the edge order.
+    base = tmp_path / "src"
+    widget = _write(base / "Widget.swift", "class Widget {\n    func go() {}\n}\n")
+    other = _write(base / "Other.swift", "class Other {\n    func go() {}\n}\n")
+    factory = _write(base / "Factory.swift", (
+        "class Factory {\n"
+        "    static func Make() -> Widget {\n"
+        "        return Widget()\n"
+        "    }\n"
+        "    static func make() -> Other {\n"
+        "        return Other()\n"
+        "    }\n"
+        "}\n"
+    ))
+    consumer = _write(base / "Consumer.swift", (
+        "struct Consumer {\n"
+        "    func run() {\n"
+        "        let x = Factory.Make()\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([widget, other, factory, consumer], tmp_path)
+
+    run_nids = _nodes_by_file(result, consumer, ".run()")
+    assert len(run_nids) == 1
+    targets = _call_targets(result, run_nids[0])
+    widget_go = _nodes_by_file(result, widget, ".go()")
+    assert len(widget_go) == 1
+    assert widget_go[0] in targets
+    assert not set(_nodes_by_file(result, other, ".go()")) & targets

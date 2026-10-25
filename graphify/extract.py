@@ -4660,9 +4660,21 @@ def _resolve_swift_member_calls(
         # one factory type; None when any step is not exactly one.
         if len(factory_defs) != 1:
             return None
-        method_nid = method_index.get((factory_defs[0], _key(factory_method)))
-        if method_nid is None:
+        # Exact-case method label, not the case-folded `method_index`: `Make()`
+        # and `make()` are different Swift methods, and a folded hit would
+        # depend on edge order or bind a `Factory.Make` type annotation to
+        # `make()`'s return type.
+        wanted = f".{factory_method}()"
+        if (factory_defs[0], _key(factory_method)) not in method_index:
             return None
+        exact = sorted(
+            m_nid for m_nid, owner in method_owner.items()
+            if owner == factory_defs[0]
+            and str((node_by_id.get(m_nid) or {}).get("label", "")) == wanted
+        )
+        if len(exact) != 1:
+            return None
+        method_nid = exact[0]
         targets = return_targets_by_method.get(method_nid, set())
         if len(targets) != 1:
             return None
