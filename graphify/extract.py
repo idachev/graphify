@@ -4777,7 +4777,7 @@ def _resolve_swift_member_calls(
             file_scopes = scopes_by_file.get(call_file, {})
             if receiver in file_scopes and file_scopes[receiver] is None:
                 # Two writes of this name in the file disagree on type or
-                # scope (АР25): bind nothing, park below as unresolved.
+                # scope (АР25): bind nothing and do not park (see below).
                 type_scope = None
             else:
                 factory_nid = factory_typed.get((call_file, receiver))
@@ -4794,8 +4794,13 @@ def _resolve_swift_member_calls(
         # The written (possibly dotted) type name is looked up from the receiver's
         # scope in the Swift type index. Only "external" (the last segment is
         # unknown to the index) falls back to the label-key path below (АР19);
-        # "ambiguous" / "unresolved" bind nothing and park like any member call
-        # whose type cannot be bound. This replaces the `_key` strip that turned
+        # "ambiguous" and a None scope (conflicting file writes, АР25, or an
+        # owner under 2+ paths, АР20) bind nothing and are NOT parked: the name
+        # is declared here, and a parked entry would let the cross-repo merge
+        # bind it to a foreign namesake (the baseline "ambiguous -> bail").
+        # "unresolved" (declared here, not visible from the scope) binds nothing
+        # and parks like any member call whose type cannot be bound. This
+        # replaces the `_key` strip that turned
         # `Outer.Inner` into `outerinner`.
         # Calls from other languages share `all_raw_calls`; they keep the label-key
         # path, which still counts same-named definitions of every language.
@@ -4804,12 +4809,14 @@ def _resolve_swift_member_calls(
         elif not is_swift_call:
             lookup_status, lookup_nid = "external", None
         elif type_scope is None:
-            lookup_status, lookup_nid = "unresolved", None
+            lookup_status, lookup_nid = "ambiguous", None
         else:
             lookup_status, lookup_nid = _swift_lookup(swift_index, type_name, type_scope)
         if lookup_status == "resolved":
             type_defs = [lookup_nid]
-        elif lookup_status in ("ambiguous", "unresolved"):
+        elif lookup_status == "ambiguous":
+            continue
+        elif lookup_status == "unresolved":
             _park_unresolved_member_call(
                 node_by_id.get(caller), callee, type_name, "swift", rc,
             )

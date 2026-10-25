@@ -331,3 +331,39 @@ def test_factory_methods_differing_in_case_bind_the_exact_one(tmp_path: Path):
     assert len(widget_go) == 1
     assert widget_go[0] in targets
     assert not set(_nodes_by_file(result, other, ".go()")) & targets
+
+
+def test_conflicting_scope_member_call_not_parked_for_cross_repo(tmp_path: Path):
+    # A None scope (АР25) is a local ambiguity, not a type declared elsewhere:
+    # parking it would let merge-graphs bind `x.go()` to a foreign `State`.
+    base = tmp_path / "src"
+    views = _write(base / "Views.swift", (
+        "struct A {\n"
+        "    struct State {\n"
+        "        func go() {}\n"
+        "    }\n"
+        "    var x: State\n\n"
+        "    func run() {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+        "struct B {\n"
+        "    struct State {\n"
+        "        func go() {}\n"
+        "    }\n"
+        "    var x: State\n\n"
+        "    func run() {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([views], tmp_path)
+
+    run_nodes = [
+        n for n in result["nodes"]
+        if n.get("label") == ".run()" and str(n.get("source_file", "")).endswith(views.name)
+    ]
+    assert len(run_nodes) == 2
+    for node in run_nodes:
+        parked = (node.get("metadata") or {}).get("unresolved_calls") or []
+        assert parked == []
