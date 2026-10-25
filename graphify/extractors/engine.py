@@ -9957,6 +9957,18 @@ def _extract_generic(
                         and tgt_nid in method_owner
                     ):
                         tgt_nid = None
+                    # Swift `x.go()` on a receiver whose type-table writes
+                    # disagree on type or scope (АР25): the bare-label map would
+                    # pick whichever `go` was declared last. Bind nothing here;
+                    # the corpus resolver stops on the None scope too.
+                    if (
+                        config.ts_module == "tree_sitter_swift"
+                        and is_member_call
+                        and swift_receiver
+                        and swift_receiver in swift_type_scopes
+                        and swift_type_scopes[swift_receiver] is None
+                    ):
+                        tgt_nid = None
                     # Swift `State()` naming a nested or same-file-duplicated
                     # type: defer to extract()'s lexical lookup (АР24). A hit on
                     # the caller's own method is not a bare-label binding and stays.
