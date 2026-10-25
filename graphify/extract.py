@@ -4882,6 +4882,11 @@ def _resolve_swift_member_calls(
                 node_by_id.get(caller), callee, type_name, "swift", rc,
             )
             continue
+        elif is_swift_call and "." in type_name:
+            # A dotted Swift name resolves only through `_swift_lookup`: the
+            # `_key` strip would turn `CommandPaletteItem.ID` into the unrelated
+            # `CommandPaletteItemID`. Unbound, it parks like any unknown type.
+            type_defs = []
         else:
             type_defs = type_def_nids.get(_key(type_name), [])
         if not type_defs:

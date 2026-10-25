@@ -138,3 +138,32 @@ def test_member_call_with_real_declaration_still_binds(tmp_path: Path):
     assert not manager_refs[0].get("_swift_extension_only")
     # `NSEvent` is still declared nowhere: its extension-only node gets no edge.
     assert not any(tgt.get("_swift_extension_only") for _, tgt in refs), refs
+
+
+def test_dotted_external_type_name_does_not_bind_through_label_key(tmp_path: Path):
+    # `CommandPaletteItem.ID` is declared nowhere here. The label key strips the dot,
+    # so without the guard `x.run()` bound to the unrelated `CommandPaletteItemID.run`.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "App" / "ItemID.swift", "enum CommandPaletteItemID {\n    func run() {}\n}\n"),
+        _write(
+            base / "App" / "Use.swift",
+            "class User {\n    let x: CommandPaletteItem.ID\n    func go() {\n        x.run()\n    }\n}\n",
+        ),
+    ]
+    result = _extract(files, tmp_path)
+
+    by_id = _by_id(result)
+    item_ids = {n["id"] for n in result["nodes"] if n.get("label") == "CommandPaletteItemID"}
+    assert item_ids, "setup: the namesake enum must exist"
+    run_ids = {
+        e["target"] for e in result["edges"]
+        if e.get("relation") == "method" and e.get("source") in item_ids
+    }
+    assert run_ids, "setup: the namesake enum must own `run()`"
+    wrong = [
+        (by_id.get(e["source"], {}).get("label"), by_id.get(e["target"], {}).get("label"))
+        for e in result["edges"]
+        if e.get("context") == "call" and e.get("target") in item_ids | run_ids
+    ]
+    assert wrong == []
