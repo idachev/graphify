@@ -7,8 +7,9 @@ follows tests/test_swift_cross_file_calls.py: write the files into ``tmp_path`` 
 Several nodes share a label such as ``State`` or ``Inner``, so a label assertion passes
 on a wrong binding. Every test therefore names the *target node*: its label, its
 ``source_file`` and the label of its parent ``contains`` edge. The target is found by
-those properties, not by a hard-coded id, so the tests hold both before and after the
-nested-type id change of Phase 3.
+those properties, not by a hard-coded id, so the Phase 2 tests hold both before and
+after the nested-type id change of Phase 3. The Phase 3 tests at the end of the file
+(and the rewritten duplicate-nested-names test) assert the new ids and need Phase 3.
 
 ``_swift_scope`` and ``_swift_lookup`` are run-local edge attributes that ``extract()``
 pops at the end, so nothing here asserts them. The outcome of the lookup is read from
@@ -22,7 +23,8 @@ from pathlib import Path
 
 import pytest
 
-from graphify.extract import extract, extract_swift
+from graphify.extract import _make_id, extract, extract_swift
+from graphify.extractors.engine import _underscore_salted_nid
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -88,6 +90,18 @@ def _assert_declaration(result: dict, nid: str, label: str, suffix: str, parent:
     assert parent in _parent_labels(result, nid), (
         f"{nid} is held by {_parent_labels(result, nid)}, not by {parent!r}"
     )
+
+
+def _method_of(result: dict, owner: str, label: str) -> str:
+    """The id of the method ``label`` that ``owner`` holds through a ``method`` edge."""
+    by_id = _by_id(result)
+    found = [
+        e["target"] for e in result["edges"]
+        if e.get("relation") == "method" and e.get("source") == owner
+        and by_id.get(e["target"], {}).get("label") == label
+    ]
+    assert len(found) == 1, f"expected one {label!r} method of {owner}, got {found}"
+    return found[0]
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -486,10 +500,11 @@ def test_member_call_dotted_type_does_not_bind_concatenated_label(tmp_path: Path
 
 
 def test_same_file_duplicate_nested_names_stay_ambiguous(tmp_path: Path):
-    # `A.State` and `B.State` declared in one file, referenced from another. Before the
-    # nested-id change of Phase 3 both fold into one node holding two qualified paths,
-    # so nothing may bind to it. With distinct nested ids each reference reaches its own
-    # State. Either way no reference reaches the wrong one.
+    # Phase 3 rewrite of the Phase 2 control (the name is kept for traceability to the
+    # RFC test plan). `A.State` and `B.State` declared in one file, referenced from
+    # other files. Before Phase 3 both folded into one node holding two qualified paths
+    # and nothing could bind to it. With distinct nested ids each reference reaches its
+    # own State, and never the other one.
     base = tmp_path / "src"
     files = [
         _write(base / "Features.swift", (
@@ -501,17 +516,21 @@ def test_same_file_duplicate_nested_names_stay_ambiguous(tmp_path: Path):
     ]
     result = _extract(files, tmp_path)
 
-    states = [n["id"] for n in result["nodes"]
-              if n.get("label") == "State" and _sf(n).endswith("Features.swift")]
+    a_state = _node(result, "State", "Features.swift", parent="A")
+    b_state = _node(result, "State", "Features.swift", parent="B")
+    assert a_state != b_state
+    _assert_declaration(result, a_state, "State", "Features.swift", "A")
+    _assert_declaration(result, b_state, "State", "Features.swift", "B")
+
     to_a = _targets(result, _node(result, "ConsumerA", "ConsumerA.swift"))
     to_b = _targets(result, _node(result, "ConsumerB", "ConsumerB.swift"))
-    if len(states) == 1:
-        assert states[0] not in to_a | to_b, "a folded two-path node must not be bound"
-    else:
-        a_state = _node(result, "State", "Features.swift", parent="A")
-        b_state = _node(result, "State", "Features.swift", parent="B")
-        assert a_state in to_a and b_state not in to_a
-        assert b_state in to_b and a_state not in to_b
+    assert a_state in to_a and b_state not in to_a
+    assert b_state in to_b and a_state not in to_b
+    for targets in (to_a, to_b):
+        assert not [t for t in targets if _is_stub(result, t)
+                    and _by_id(result)[t].get("label") in ("A.State", "B.State")], (
+            "the repointed qualified reference must not leave its stub behind"
+        )
 
 
 def test_no_cross_language_binding(tmp_path: Path):
@@ -591,3 +610,109 @@ def test_dotted_external_name_keeps_its_full_label_on_stub(tmp_path: Path, name:
     labels = {_by_id(result)[t].get("label") for t in targets}
     assert name in labels, f"expected a stub labelled {name!r}, got {labels}"
     assert all(_is_stub(result, t) for t in targets if _by_id(result)[t].get("label") == name)
+
+
+# ── Phase 3: nested type identity ─────────────────────────────────────────────
+
+def test_same_file_nested_types_get_distinct_ids(tmp_path: Path):
+    # Two nested types with one name in one file. A nested id is
+    # `_make_id(parent_class_nid, name)`, so the two never share a node. Nothing
+    # collides here (no member slugs to `state`), so the ids are not salted.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "Features.swift", (
+            "struct A {\n    struct State { var a: Int }\n}\n"
+            "struct B {\n    struct State { var b: Int }\n}\n"
+        )),
+    ]
+    result = _extract(files, tmp_path)
+
+    a_nid = _node(result, "A", "Features.swift")
+    b_nid = _node(result, "B", "Features.swift")
+    states = {n["id"] for n in result["nodes"]
+              if n.get("label") == "State" and _sf(n).endswith("Features.swift")}
+    assert states == {_make_id(a_nid, "State"), _make_id(b_nid, "State")}, (
+        "each nested State has its own id, built from its parent's id"
+    )
+    _assert_declaration(result, _make_id(a_nid, "State"), "State", "Features.swift", "A")
+    _assert_declaration(result, _make_id(b_nid, "State"), "State", "Features.swift", "B")
+    assert _parent_labels(result, _make_id(a_nid, "State")) == {"A"}
+    assert _parent_labels(result, _make_id(b_nid, "State")) == {"B"}
+
+
+def test_nested_type_and_same_slug_method_both_kept(tmp_path: Path):
+    # RFC r1 F10: `struct State` and `func state()` of one parent slug to one id
+    # (ids are caseless) and `add_node` would drop the second node. The collision
+    # pre-scan salts both ids, so both survive with their edges, and a reference from
+    # another file still reaches the nested type.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "Outer.swift", (
+            "struct Outer {\n"
+            "    struct State { var n: Int }\n"
+            "    func state() {}\n"
+            "}\n"
+        )),
+        _write(base / "Consumer.swift", "struct Consumer {\n    var s: Outer.State\n}\n"),
+    ]
+    result = _extract(files, tmp_path)
+
+    outer = _node(result, "Outer", "Outer.swift")
+    plain = _make_id(outer, "State")
+    assert plain == _make_id(outer, "state"), "the type and the method slug to one id"
+    groups = {plain: {"State", "state"}}
+    state_nid = _underscore_salted_nid(plain, "State", groups)
+    method_nid = _underscore_salted_nid(plain, "state", groups)
+    assert state_nid != method_nid
+
+    state = _node(result, "State", "Outer.swift", parent="Outer")
+    method = _method_of(result, outer, ".state()")
+    assert state == state_nid
+    assert method == method_nid
+    _assert_declaration(result, state, "State", "Outer.swift", "Outer")
+    assert _sf(_by_id(result)[method]).endswith("Outer.swift")
+    assert state in _targets(result, _node(result, "Consumer", "Consumer.swift")), (
+        "the reference from another file reaches the nested type, not the method"
+    )
+    assert method not in _targets(result, _node(result, "Consumer", "Consumer.swift"))
+
+
+def test_bare_in_body_reference_binds_own_nested_type(tmp_path: Path):
+    # Two features in one file, each with its own nested `State`. A bare `State` in a
+    # method signature misses the same-file shortcut once the ids are distinct and
+    # resolves through the lexical lookup to the State of its own enclosing type.
+    base = tmp_path / "src"
+    files = [
+        _write(base / "Features.swift", (
+            "struct A {\n"
+            "    struct State { var a: Int }\n"
+            "    func f(_ s: State) {}\n"
+            "}\n"
+            "struct B {\n"
+            "    struct State { var b: Int }\n"
+            "    func f(_ s: State) {}\n"
+            "}\n"
+        )),
+    ]
+    result = _extract(files, tmp_path)
+
+    a_nid = _node(result, "A", "Features.swift")
+    b_nid = _node(result, "B", "Features.swift")
+    a_state = _node(result, "State", "Features.swift", parent="A")
+    b_state = _node(result, "State", "Features.swift", parent="B")
+    assert a_state == _make_id(a_nid, "State")
+    assert b_state == _make_id(b_nid, "State")
+    _assert_declaration(result, a_state, "State", "Features.swift", "A")
+    _assert_declaration(result, b_state, "State", "Features.swift", "B")
+
+    a_f = _method_of(result, a_nid, ".f()")
+    b_f = _method_of(result, b_nid, ".f()")
+    a_targets = _targets(result, a_f)
+    b_targets = _targets(result, b_f)
+    assert a_state in a_targets and b_state not in a_targets
+    assert b_state in b_targets and a_state not in b_targets
+    for targets in (a_targets, b_targets):
+        assert not [t for t in targets if _is_stub(result, t)
+                    and _by_id(result)[t].get("label") == "State"], (
+            "a bare in-body reference must not stay on a sourceless stub"
+        )
