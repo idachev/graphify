@@ -99,12 +99,14 @@ MAIN = "from lib import Inner\n\ndef use():\n    return Inner.go()\n"
 def test_python_to_python_member_call_binds_in_mixed_corpus(tmp_path):
     (tmp_path / "lib.py").write_text(LIB)
     (tmp_path / "main.py").write_text(MAIN)
-    (tmp_path / "inner.swift").write_text("class Inner {\n    static func go() {}\n}\n")
-    (tmp_path / "use.py").write_text("def run():\n    Inner.go()\n")
-    paths = [tmp_path / name for name in ("lib.py", "main.py", "inner.swift", "use.py")]
+    # A distinct Swift class name: a second `Inner` would trip the pass's
+    # single-definition guard and drop the Python edge, as before the gate.
+    (tmp_path / "widget.swift").write_text("class Widget {\n    static func go() {}\n}\n")
+    (tmp_path / "use.py").write_text("def run():\n    Widget.go()\n")
+    paths = [tmp_path / name for name in ("lib.py", "main.py", "widget.swift", "use.py")]
     calls = _calls(extract(paths, root=tmp_path, cache_root=tmp_path))
     assert ("use()", "main.py", ".go()", "lib.py") in calls
-    assert not any(src == "use.py" and dst == "inner.swift" for _, src, _, dst in calls)
+    assert not any(src == "use.py" and dst == "widget.swift" for _, src, _, dst in calls)
 
 
 def test_file_mapped_to_python_by_graphifyrc_still_binds(tmp_path):
@@ -114,3 +116,26 @@ def test_file_mapped_to_python_by_graphifyrc_still_binds(tmp_path):
     paths = [tmp_path / "lib.pyx", tmp_path / "main.pyx"]
     calls = _calls(extract(paths, root=tmp_path, cache_root=tmp_path))
     assert ("use()", "main.pyx", ".go()", "lib.pyx") in calls
+
+
+def test_same_named_swift_class_does_not_block_python_binding(tmp_path):
+    # Only Python classes count for the single-definition guard, so a Swift
+    # `Inner` neither steals the call nor suppresses the Python edge.
+    (tmp_path / "lib.py").write_text(LIB)
+    (tmp_path / "main.py").write_text(MAIN)
+    (tmp_path / "inner.swift").write_text("class Inner {\n    static func go() {}\n}\n")
+    (tmp_path / "use.py").write_text("def run():\n    Inner.go()\n")
+    paths = [tmp_path / name for name in ("lib.py", "main.py", "inner.swift", "use.py")]
+    calls = _calls(extract(paths, root=tmp_path, cache_root=tmp_path))
+    assert ("use()", "main.py", ".go()", "lib.py") in calls
+    assert not any(src.endswith(".py") and dst == "inner.swift" for _, src, _, dst in calls)
+
+
+def test_two_python_classes_with_the_same_name_still_bind_nothing():
+    c_nodes, c_edges, caller_nid = _caller("use", "use.py")
+    a_nodes, a_edges, _ = _class_with_method("a", "Inner", "a.py")
+    b_nodes, b_edges, _ = _class_with_method("b", "Inner", "b.py")
+    nodes, edges = c_nodes + a_nodes + b_nodes, c_edges + a_edges + b_edges
+    raw = _member_call(caller_nid, "Inner", "go", "use.py")
+    _resolve_python_member_calls([{"raw_calls": [raw]}], nodes, edges)
+    assert not any(e.get("relation") == "calls" for e in edges)
