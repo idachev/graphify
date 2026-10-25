@@ -157,3 +157,213 @@ def test_python_static_call_does_not_bind_swift_type(tmp_path: Path):
     for e in result["edges"]:
         if e.get("source") in callers:
             assert e["target"] not in swift_go
+
+
+def test_uppercase_static_factory_keeps_return_type_binding(tmp_path: Path):
+    # `Factory.Make()` is recorded as the dotted path "Factory.Make" (АР12); it
+    # names no type, so it is retried as factory `Factory`, method `Make`.
+    base = tmp_path / "src"
+    types = _write(base / "Types.swift", (
+        "class Widget {\n"
+        "    func go() {}\n"
+        "}\n"
+        "class Factory {\n"
+        "    static func Make() -> Widget {\n"
+        "        return Widget()\n"
+        "    }\n"
+        "}\n"
+    ))
+    consumer = _write(base / "Consumer.swift", (
+        "struct Consumer {\n"
+        "    func run() {\n"
+        "        let x = Factory.Make()\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([types, consumer], tmp_path)
+
+    run_nids = _nodes_by_file(result, consumer, ".run()")
+    assert len(run_nids) == 1
+    go_nids = _nodes_by_file(result, types, ".go()")
+    assert len(go_nids) == 1
+    assert go_nids[0] in _call_targets(result, run_nids[0])
+
+
+def test_factory_return_nested_type_with_top_level_namesake_binds(tmp_path: Path):
+    # The fold binds the exact return nid, so a top-level `Inner` beside
+    # `Outer.Inner` must not void the binding, nor receive the call.
+    base = tmp_path / "src"
+    outer = _write(base / "Outer.swift", (
+        "struct Outer {\n"
+        "    struct Inner {\n"
+        "        func go() {}\n"
+        "    }\n"
+        "}\n"
+    ))
+    top = _write(base / "Inner.swift", (
+        "struct Inner {\n"
+        "    func go() {}\n"
+        "}\n"
+    ))
+    factory = _write(base / "ServiceFactory.swift", (
+        "class ServiceFactory {\n"
+        "    static func make() -> Outer.Inner {\n"
+        "        return Outer.Inner()\n"
+        "    }\n"
+        "}\n"
+    ))
+    consumer = _write(base / "Consumer.swift", (
+        "struct Consumer {\n"
+        "    func run() {\n"
+        "        let x = ServiceFactory.make()\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([outer, top, factory, consumer], tmp_path)
+
+    run_nids = _nodes_by_file(result, consumer, ".run()")
+    assert len(run_nids) == 1
+    targets = _call_targets(result, run_nids[0])
+    nested_go = _nodes_by_file(result, outer, ".go()")
+    assert len(nested_go) == 1
+    assert nested_go[0] in targets
+    assert not set(_nodes_by_file(result, top, ".go()")) & targets
+
+
+def test_member_call_same_param_name_in_two_types_binds_nothing(tmp_path: Path):
+    # `x` names a different nested `State` in each type of one file; the flat
+    # per-file table cannot tell them apart (АР25), so neither call binds.
+    base = tmp_path / "src"
+    views = _write(base / "Views.swift", (
+        "struct A {\n"
+        "    struct State {\n"
+        "        func go() {}\n"
+        "    }\n"
+        "    var x: State\n\n"
+        "    func run() {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+        "struct B {\n"
+        "    struct State {\n"
+        "        func go() {}\n"
+        "    }\n"
+        "    var x: State\n\n"
+        "    func run() {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([views], tmp_path)
+
+    go_nids = set(_nodes_by_file(result, views, ".go()"))
+    run_nids = _nodes_by_file(result, views, ".run()")
+    assert len(go_nids) == 2
+    assert len(run_nids) == 2
+    for run_nid in run_nids:
+        assert not _call_targets(result, run_nid) & go_nids
+
+
+def test_dotted_typealias_annotation_does_not_bind_case_folded_factory(tmp_path: Path):
+    # `x: Factory.Make` names a typealias (no node), so the dotted retry tries
+    # factory `Factory`, method `Make`; only `make()` exists, which must not match.
+    base = tmp_path / "src"
+    types = _write(base / "Types.swift", (
+        "class Widget {\n"
+        "    func go() {}\n"
+        "}\n"
+        "struct Factory {\n"
+        "    typealias Make = Int\n"
+        "    static func make() -> Widget {\n"
+        "        return Widget()\n"
+        "    }\n"
+        "}\n"
+    ))
+    consumer = _write(base / "Consumer.swift", (
+        "class Consumer {\n"
+        "    var x: Factory.Make\n\n"
+        "    func run() {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([types, consumer], tmp_path)
+
+    run_nids = _nodes_by_file(result, consumer, ".run()")
+    assert len(run_nids) == 1
+    go_nids = set(_nodes_by_file(result, types, ".go()"))
+    assert len(go_nids) == 1
+    assert not _call_targets(result, run_nids[0]) & go_nids
+
+
+def test_factory_methods_differing_in_case_bind_nothing(tmp_path: Path):
+    # Node ids are caseless, so `Make()` and `make()` of one type are one node
+    # with two return types: the factory binds neither, whatever the edge order.
+    base = tmp_path / "src"
+    widget = _write(base / "Widget.swift", "class Widget {\n    func go() {}\n}\n")
+    other = _write(base / "Other.swift", "class Other {\n    func go() {}\n}\n")
+    factory = _write(base / "Factory.swift", (
+        "class Factory {\n"
+        "    static func Make() -> Widget {\n"
+        "        return Widget()\n"
+        "    }\n"
+        "    static func make() -> Other {\n"
+        "        return Other()\n"
+        "    }\n"
+        "}\n"
+    ))
+    consumer = _write(base / "Consumer.swift", (
+        "struct Consumer {\n"
+        "    func run() {\n"
+        "        let x = Factory.Make()\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([widget, other, factory, consumer], tmp_path)
+
+    run_nids = _nodes_by_file(result, consumer, ".run()")
+    assert len(run_nids) == 1
+    targets = _call_targets(result, run_nids[0])
+    go_nids = (set(_nodes_by_file(result, widget, ".go()"))
+               | set(_nodes_by_file(result, other, ".go()")))
+    assert len(go_nids) == 2
+    assert not go_nids & targets
+
+
+def test_conflicting_scope_member_call_not_parked_for_cross_repo(tmp_path: Path):
+    # A None scope (АР25) is a local ambiguity, not a type declared elsewhere:
+    # parking it would let merge-graphs bind `x.go()` to a foreign `State`.
+    base = tmp_path / "src"
+    views = _write(base / "Views.swift", (
+        "struct A {\n"
+        "    struct State {\n"
+        "        func go() {}\n"
+        "    }\n"
+        "    var x: State\n\n"
+        "    func run() {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+        "struct B {\n"
+        "    struct State {\n"
+        "        func go() {}\n"
+        "    }\n"
+        "    var x: State\n\n"
+        "    func run() {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([views], tmp_path)
+
+    run_nodes = [
+        n for n in result["nodes"]
+        if n.get("label") == ".run()" and str(n.get("source_file", "")).endswith(views.name)
+    ]
+    assert len(run_nodes) == 2
+    for node in run_nodes:
+        parked = (node.get("metadata") or {}).get("unresolved_calls") or []
+        assert parked == []
