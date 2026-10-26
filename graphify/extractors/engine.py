@@ -1508,8 +1508,9 @@ def _swift_file_decl_owners(root_node, bodies: dict[str, list], source: bytes,
     ``_make_id(_make_id(_make_id(stem, "A"), "B"), "c")``. A file-level
     declaration has the enclosing path ``""``; an extension of a type not
     declared here counts as a file-level type, as it mints that type's node.
-    ``bodies`` is the first result of ``_swift_nested_scan``; kinds are as in
-    ``_swift_body_members``.
+    A member that its sibling collision group salts is left out, as it does not
+    hold the plain id. ``bodies`` is the first result of ``_swift_nested_scan``;
+    kinds are as in ``_swift_body_members``.
     """
     owners: dict[str, set[tuple[str, str]]] = {}
 
@@ -1522,9 +1523,14 @@ def _swift_file_decl_owners(root_node, bodies: dict[str, list], source: bytes,
     for path, path_bodies in bodies.items():
         if "." not in path:
             _add("", path, "type")
+        parent_nid = _make_id(stem, path)
+        groups = _swift_nested_collision_groups(path_bodies, source, parent_nid)
         for body in path_bodies:
             for name, kind in _swift_body_members(body, source):
-                _add(path, name, kind)
+                plain = _make_id(parent_nid, name)
+                # A member its sibling group salts no longer holds the plain id.
+                if _swift_salted_member_nid(plain, name, kind, groups.get(plain)) == plain:
+                    _add(path, name, kind)
     return owners
 
 
@@ -6314,6 +6320,9 @@ def _extract_generic(
     swift_nested_plan: list = []
     swift_nested_groups: dict = {}
     swift_path_nids: dict[str, str] = {}
+    # Qualified path -> nid of each nested type salted because a declaration of
+    # another scope holds its plain id (ТД3), for written references to it.
+    swift_cross_salted: dict[str, str] = {}
 
     def _swift_ensure_nested_plan() -> None:
         # [bodies, nested, plain id owners], scanned once on first use.
@@ -6341,6 +6350,7 @@ def _extract_generic(
             # A declaration of another scope holds the id (ТД3).
             tagged = f"nested:{parent_path}.{name}".encode("utf-8")
             nid = _make_id(nid, hashlib.sha1(tagged, usedforsecurity=False).hexdigest()[:6])
+            swift_cross_salted[f"{parent_path}.{name}"] = nid
         return nid
 
     def _swift_nested_path_nid(path: str) -> str | None:
@@ -6411,6 +6421,12 @@ def _extract_generic(
         edges.append(edge)
 
     def ensure_named_node(name: str, line: int) -> str:
+        if config.ts_module == "tree_sitter_swift" and "." in name:
+            # `Outer.State` slugs to the plain id that a file-level `Outer_State`
+            # holds when the nested type got the ТД3 salt.
+            _swift_nested_path_nid(name)
+            if name in swift_cross_salted:
+                return swift_cross_salted[name]
         nid = _make_id(stem, ".".join(namespace_stack), name)
         if config.ts_module == "tree_sitter_c_sharp":
             nid = _underscore_salted_nid(nid, name, csharp_type_groups)

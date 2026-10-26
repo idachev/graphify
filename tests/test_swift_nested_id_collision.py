@@ -144,6 +144,48 @@ def test_deeper_nested_type_yields_to_shallower_nested_type(tmp_path: Path):
     assert _sources(result, _one(result, ".shallow()"), "method") == {a_b}
 
 
+def test_written_reference_reaches_salted_nested_type(tmp_path: Path):
+    # ЗД32 r1 F1: `Outer.State` slugs to the plain id the file-level `Outer_State`
+    # holds; the references must reach the salted nested type.
+    result = extract_swift(_write(tmp_path / "Outer.swift", (
+        "struct Outer {\n"
+        "    struct State {}\n"
+        "}\n"
+        "struct Outer_State {}\n"
+        "func consume(_ x: Outer.State) -> Outer.State { x }\n"
+    )))
+
+    state = _one(result, "State")
+    top_type = _one(result, "Outer_State")
+    consume = _one(result, "consume()")
+    targets = {
+        e["target"] for e in result["edges"]
+        if e.get("relation") == "references" and e.get("source") == consume
+    }
+    assert state in targets
+    assert top_type not in targets
+
+
+def test_sibling_salted_ids_do_not_salt_a_deeper_type(tmp_path: Path):
+    # ЗД32 r1 F2: the sibling rule already salts `A_B` and `a_b()`, so nothing of
+    # another scope holds the plain id and `Outer.A.B` keeps it (no id churn).
+    result = extract_swift(_write(tmp_path / "Outer.swift", (
+        "struct Outer {\n"
+        "    struct A {\n"
+        "        struct B {}\n"
+        "    }\n"
+        "    struct A_B {}\n"
+        "    func a_b() {}\n"
+        "}\n"
+    )))
+
+    a = _one(result, "A")
+    b = _one(result, "B")
+    assert b == _make_id(a, "B")
+    assert b != _one(result, "A_B")
+    assert b != _one(result, ".a_b()")
+
+
 def test_nested_type_id_unchanged_without_collision(tmp_path: Path):
     # Not a regression test (passes before the fix): without a declaration of
     # another scope on the id, the nested type keeps its Phase 3 id.
