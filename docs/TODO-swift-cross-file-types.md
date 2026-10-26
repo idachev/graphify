@@ -105,6 +105,20 @@ struct F { static func make() -> Lib { Lib() } }` in `Lib.swift` and
 log `tmp/claude-logs/zd33-r1-f5general-20261026-074116.log`). Only the unproven-factory form
 (`<Box: Q>`, `let x = Box.make()`) binds nothing since ЗД33 r1.
 
+Also open (ЗД33 r2, same wrong edge on 0c7165fc and on the ЗД33 head, binding sites the
+negative collector `_swift_unproven_bindings` does not read; repro
+`tmp/captain/20261023-145049/reports/zd33-r2-repro/repro.py`, logs
+`tmp/claude-logs/zd33-r2-repro-{head,base}-20261026-075007.log`), each binding `A.a` to `State.go`:
+
+- an annotated binding with an unproven factory initializer: `protocol P { func go() };
+  protocol Q { static func make() -> any P }; struct State: P { func go() {} };
+  struct A<Box: Q> { func a() { let x: any P = Box.make(); x.go() } }` (the collector drops the
+  initializer once an annotation is present; the first ЗД33 commit 5102c9ac blocked it);
+- a typed optional binding: `protocol P { func go() }; struct State { func go() {} };
+  struct A<State: P> { func a(_ v: State?) { if let x: State = v { x.go() } } }` (also `guard let`, `for`);
+- a typed tuple pattern: same declarations,
+  `struct A<State: P> { func a(_ v: State) { let (x, y): (State, Int) = (v, 0); x.go() } }`.
+
 **Why not here.** Pre-existing behaviour outside the documented phases. The full fix must prove
 the receiver's owner for every write or bind nothing, with tests for swapped declaration order.
 
