@@ -124,7 +124,97 @@ CASES = {
         "    }\n"
         "}\n",
         False, [".a()"]),
+    # Review r1 F1: a rejected upper-cased variable is not the type `X` (new on
+    # 5102c9ac: `A.a -> X.go`, or `references` to `X`, or a parked call).
+    "R1_F1_upper_param_with_X_go": (
+        "struct X { func go() {} }\n"
+        "struct Other { func go() {} }\n"
+        "struct A {\n"
+        "    typealias State = Other\n"
+        "    func a(_ X: State) {\n"
+        "        X.go()\n"
+        "    }\n"
+        "}\n",
+        False, [".a()"]),
+    "R1_F1_upper_param_type_without_go": (
+        "struct X {}\n"
+        "struct Other { func go() {} }\n"
+        "struct A {\n"
+        "    typealias State = Other\n"
+        "    func a(_ X: State) {\n"
+        "        X.go()\n"
+        "    }\n"
+        "}\n",
+        False, [".a()"]),
+    "R1_F1_upper_param_no_type": (
+        "struct Other { func go() {} }\n"
+        "struct A {\n"
+        "    typealias State = Other\n"
+        "    func a(_ X: State) {\n"
+        "        X.go()\n"
+        "    }\n"
+        "}\n",
+        False, [".a()"]),
+    # Review r1 F2-F5: binding sites the table does not read (pre-existing).
+    "R1_F2_typed_local": (
+        "protocol P { func go() }\n"
+        "struct State { func go() {} }\n"
+        "struct A<State: P> {\n"
+        "    func a(_ v: State) {\n"
+        "        let x: State = v\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n",
+        False, [".a()"]),
+    "R1_F2_typed_closure_param": (
+        "protocol P { func go() }\n"
+        "struct State { func go() {} }\n"
+        "struct A<State: P> {\n"
+        "    func a(_ v: [State]) {\n"
+        "        v.forEach { (x: State) in\n"
+        "            x.go()\n"
+        "        }\n"
+        "    }\n"
+        "}\n",
+        False, [".a()"]),
+    "R1_F3_multi_binding_property": (
+        "protocol P { func go() }\n"
+        "struct State { func go() {} }\n"
+        "struct A<State: P> {\n"
+        "    var a: State, x: State\n"
+        "    func run() {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n",
+        False, [".run()"]),
+    "R1_F4_file_scope_var": (
+        "struct Other { func go() {} }\n"
+        "struct State { func go() {} }\n"
+        "struct A { typealias State = Other }\n"
+        "var x: A.State = Other()\n"
+        "func useIt() {\n"
+        "    x.go()\n"
+        "}\n",
+        False, ["useIt()"]),
+    "R1_F5_factory_local_shadows_param": (
+        "protocol P { func go() }\n"
+        "protocol Q {\n"
+        "    associatedtype R: P\n"
+        "    static func make() -> R\n"
+        "}\n"
+        "struct State { func go() {} }\n"
+        "struct A<Box: Q> {\n"
+        "    func a(_ x: State) {\n"
+        "        let x = Box.make()\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n",
+        False, [".a()"]),
 }
+
+
+def _receiver(case: str) -> str:
+    return "X" if case.startswith("R1_F1_") else "x"
 
 
 def _write(path: Path, text: str) -> Path:
@@ -147,18 +237,10 @@ def _corpus(tmp_path: Path, source: str, with_lib: bool) -> tuple[list[Path], Pa
 
 
 def _call_lines(source: str) -> set[str]:
+    # The lines of the receiver's `.go()` calls (never a `func go()` declaration).
     return {
         f"L{i}" for i, line in enumerate(source.splitlines(), start=1)
-        if "x.go()" in line or "x?.go()" in line
-    }
-
-
-def _protocol_methods(result: dict, protocol: str) -> set[str]:
-    by_id = {n["id"]: n for n in result["nodes"]}
-    return {
-        e["target"] for e in result["edges"]
-        if e.get("relation") == "method"
-        and by_id.get(e.get("source"), {}).get("label") == protocol
+        if ".go()" in line and "func " not in line
     }
 
 
@@ -175,26 +257,28 @@ def test_unproven_receiver_type_binds_nothing(tmp_path: Path, case: str):
     files, main = _corpus(tmp_path, source, with_lib)
     result = _run(files, tmp_path)
 
-    lines = _call_lines(source)
-    # A constrained generic or an associatedtype `State: P` really dispatches
-    # through P, so a P.go target would not be wrong; nothing else may bind.
-    allowed = _protocol_methods(result, "P")
     for label in caller_labels:
-        callers = _callers(result, label, main)
-        assert callers, f"{case}: caller {label} not extracted"
-        for caller in callers:
-            wrong = [
-                e for e in result["edges"]
-                if e.get("source") == caller["id"]
-                and e.get("relation") in ("calls", "references")
-                and e.get("source_location") in lines
-                and e.get("target") not in allowed
-            ]
-            assert not wrong, f"{case}: {label} x.go() bound {wrong}"
-            parked = (caller.get("metadata") or {}).get("unresolved_calls") or []
-            assert not [p for p in parked if isinstance(p, dict) and p.get("callee") == "go"], (
-                f"{case}: {label} parked x.go(): {parked}"
-            )
+        _assert_binds_nothing(result, case, label, main, source)
+
+
+def _assert_binds_nothing(result: dict, case: str, label: str, main: Path, source: str) -> None:
+    # A rejected receiver binds nothing at all: no `calls`, no `references` on the
+    # call line, no parked call.
+    lines = _call_lines(source)
+    callers = _callers(result, label, main)
+    assert callers, f"{case}: caller {label} not extracted"
+    for caller in callers:
+        wrong = [
+            e for e in result["edges"]
+            if e.get("source") == caller["id"]
+            and e.get("relation") in ("calls", "references")
+            and e.get("source_location") in lines
+        ]
+        assert not wrong, f"{case}: {label} .go() bound {wrong}"
+        parked = (caller.get("metadata") or {}).get("unresolved_calls") or []
+        assert not [p for p in parked if isinstance(p, dict) and p.get("callee") == "go"], (
+            f"{case}: {label} parked .go(): {parked}"
+        )
 
 
 @pytest.mark.parametrize("case", sorted(CASES))
@@ -205,8 +289,9 @@ def test_unproven_receiver_write_is_recorded_as_unknown(tmp_path: Path, case: st
     _files, main = _corpus(tmp_path, source, with_lib)
     table = extract_swift(main).get("swift_type_table")
 
+    receiver = _receiver(case)
     assert table is not None
-    assert "x" in table["scopes"] and table["scopes"]["x"] is None
+    assert receiver in table["scopes"] and table["scopes"][receiver] is None
 
 
 def test_plain_struct_receiver_still_binds_same_file(tmp_path: Path):
@@ -263,22 +348,22 @@ def test_plain_struct_receiver_still_binds_cross_file(tmp_path: Path):
     )
 
 
-def _cached_type_tables(cache: Path) -> list[dict]:
-    tables = []
+def _cached_payloads(cache: Path) -> list[tuple[Path, dict]]:
+    payloads = []
     for path in cache.rglob("*.json"):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
         if isinstance(payload, dict) and isinstance(payload.get("swift_type_table"), dict):
-            tables.append(payload["swift_type_table"])
-    return tables
+            payloads.append((path, payload))
+    return payloads
 
 
 def test_rejection_survives_cache_round_trip(tmp_path: Path):
     # A scopes-only result (the generic-parameter write is rejected, the table is
     # empty) and a single-write typealias result keep their None through the AST
-    # cache, and the cached second run binds no wrong edge either.
+    # cache, and the cached second run binds and parks nothing either.
     source, _with_lib, _labels = CASES["H8b_type_generic_plain_single_write"]
     alias_source, _with_lib, _labels = CASES["X_F1b_plain_typealias"]
     base = tmp_path / "src"
@@ -288,12 +373,23 @@ def test_rejection_survives_cache_round_trip(tmp_path: Path):
     files = [lib, generic, alias]
 
     first = _run(files, tmp_path)
-    tables = _cached_type_tables(tmp_path / "cache")
+    payloads = _cached_payloads(tmp_path / "cache")
+    tables = [payload["swift_type_table"] for _path, payload in payloads]
     unknown = [t for t in tables if (t.get("scopes") or {}).get("x", "") is None]
     assert len(unknown) == 2, tables
     assert any(not t.get("table") for t in unknown), "scopes-only result not cached"
+    # Mark the cached entries: the second run must replay them, not re-extract.
+    for path, payload in payloads:
+        sentinel = dict(payload["nodes"][0], id=f"zd33_sentinel_{path.stem}",
+                        label="ZD33CacheSentinel")
+        payload["nodes"].append(sentinel)
+        path.write_text(json.dumps(payload), encoding="utf-8")
 
     second = _run(files, tmp_path)
+
+    assert len([n for n in second["nodes"] if n.get("label") == "ZD33CacheSentinel"]) == 2, (
+        "the second run did not read the cached entries"
+    )
 
     def _edges(result: dict) -> set[tuple]:
         return {
@@ -304,13 +400,4 @@ def test_rejection_survives_cache_round_trip(tmp_path: Path):
     assert _edges(second) == _edges(first)
     for result in (first, second):
         for main, src in ((generic, source), (alias, alias_source)):
-            lines = _call_lines(src)
-            allowed = _protocol_methods(result, "P")
-            for caller in _callers(result, ".a()", main):
-                assert not [
-                    e for e in result["edges"]
-                    if e.get("source") == caller["id"]
-                    and e.get("relation") in ("calls", "references")
-                    and e.get("source_location") in lines
-                    and e.get("target") not in allowed
-                ]
+            _assert_binds_nothing(result, "round trip", ".a()", main, src)

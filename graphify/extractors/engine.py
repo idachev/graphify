@@ -1707,6 +1707,74 @@ def _swift_type_unproven(type_name: str, shadow_names: frozenset[str]) -> bool:
     return segments[0] == "Self" or any(s in shadow_names for s in segments)
 
 
+def _swift_annotation_unproven(type_node, source: bytes, shadow_names: frozenset[str]) -> bool:
+    """True when a written type annotation does not record a proven type."""
+    refs: list[tuple[str, str]] = []
+    _swift_collect_type_refs(type_node, source, False, refs)
+    recorded = next((name for name, role in refs if role == "type"), None)
+    return recorded is None or _swift_type_unproven(recorded, shadow_names)
+
+
+def _swift_initializer_unproven(init_node, source: bytes, shadow_names: frozenset[str]) -> bool:
+    """True when a binding's initializer names its type through an unproven path.
+
+    `let x = T()`, `let x = T.shared` and the factory `let x = T.make()`.
+    """
+    written: str | None = None
+    if init_node.type == "call_expression":
+        written = _swift_constructor_type(init_node, source)
+        if written is None:
+            factory = _swift_factory_call(init_node, source)
+            written = factory[0] if factory else None
+    elif init_node.type == "navigation_expression":
+        written = _swift_navigation_type_head(init_node, source)
+    return written is not None and _swift_type_unproven(written, shadow_names)
+
+
+def _swift_unproven_bindings(root_node, source: bytes,
+                             shadow_names: frozenset[str]) -> list[str]:
+    """Names of Swift bindings anywhere in the file whose written type is unproven.
+
+    Negative facts only, for the binding sites the receiver table does not read:
+    every name of a (protocol) property declaration at any level (file scope,
+    type member, local; `var a, b: T` and `var a: T, b: U` included) whose
+    annotation records no proven type, or which has no annotation and an
+    initializer through an unproven type, and every typed closure parameter
+    whose type is unproven. Untyped bindings are not listed.
+    """
+    names: list[str] = []
+    stack = [root_node]
+    while stack:
+        n = stack.pop()
+        if n.type in ("property_declaration", "protocol_property_declaration"):
+            pending: list[str] = []
+            for c in n.children:
+                if c.type == "pattern":
+                    name_node = next(
+                        (sc for sc in c.children if sc.type == "simple_identifier"), None
+                    )
+                    if name_node is not None and _read_text(name_node, source):
+                        pending.append(_read_text(name_node, source))
+                elif c.type == "type_annotation":
+                    if _swift_annotation_unproven(c, source, shadow_names):
+                        names.extend(pending)
+                    pending = []
+                elif pending and _swift_initializer_unproven(c, source, shadow_names):
+                    names.extend(pending)
+                    pending = []
+        elif n.type == "lambda_parameter":
+            idents = [c for c in n.children if c.type == "simple_identifier"]
+            type_node = next(
+                (c for c in n.children if c.is_named
+                 and c.type not in ("simple_identifier", "parameter_modifiers")), None,
+            )
+            if (idents and type_node is not None
+                    and _swift_annotation_unproven(type_node, source, shadow_names)):
+                names.append(_read_text(idents[-1], source))
+        stack.extend(n.children)
+    return names
+
+
 def _swift_classify_base(name: str, kind: str | None, is_first: bool,
                           protocols: set[str], classes: set[str]) -> str:
     """Classify a Swift inheritance_specifier entry as `inherits` or `implements`.
@@ -10668,11 +10736,12 @@ def _extract_generic(
             body_scope = swift_body_scopes.get(id(body_node), "")
             for local_name, local_type in body_bindings:
                 _swift_set_type_scope(local_name, local_type, body_scope)
-        # A factory binding (`let x = T.make()`) through a shadow name would be
-        # resolved against an unrelated same-named factory type corpus-side.
-        for factory_name, (factory_type, _method) in swift_factory_bindings.items():
-            if _swift_type_unproven(factory_type, swift_shadow_names):
-                _swift_set_type_scope(factory_name, None, "")
+        # Binding sites the table does not read (typed locals, typed closure
+        # parameters, every name of a multi-binding property, file-scope
+        # bindings, a factory local shadowing a recorded name) still make an
+        # unproven name unknown, before walk_calls reads the scopes.
+        for unproven_name in _swift_unproven_bindings(root, source, swift_shadow_names):
+            _swift_set_type_scope(unproven_name, None, "")
 
     # JS/TS: bodies already walked with their own caller_nid (const-assigned
     # arrows, methods). An INLINE/returned arrow or function-expression that is

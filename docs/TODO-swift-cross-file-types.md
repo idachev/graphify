@@ -96,6 +96,15 @@ Still open: a single proven write (`x: First` binds `x.go()` to a `Second.go` de
 the file), the last-segment type compare (Codex ТД8 F2) and the case-folded method keys of the
 resolver (F3). Untyped receivers and chains are unchanged.
 
+Also open (ЗД33 r1 F5, general case): a proven factory local that shadows a typed parameter
+keeps the parameter's type, because the local collector stashes a factory only for a name not
+yet in the table. With `struct State { func go() {} }; struct Lib { func go() {} };
+struct F { static func make() -> Lib { Lib() } }` in `Lib.swift` and
+`struct A { func a(_ x: State) { let x = F.make(); x.go() } }` in `M.swift`, `A.a` binds
+`State.go` instead of `Lib.go` (`tmp/captain/20261023-145049/reports/zd33-r1-repro/f5general.py`,
+log `tmp/claude-logs/zd33-r1-f5general-20261026-074116.log`). Only the unproven-factory form
+(`<Box: Q>`, `let x = Box.make()`) binds nothing since ЗД33 r1.
+
 **Why not here.** Pre-existing behaviour outside the documented phases. The full fix must prove
 the receiver's owner for every write or bind nothing, with tests for swapped declaration order.
 
