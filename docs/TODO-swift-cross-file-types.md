@@ -58,25 +58,6 @@ as a top-level type named `Outer_State` in the same file (`_swift_member_nid`,
 **Why not here.** The input is artificial and the fix is a change of the id scheme shared with
 Python, outside the task's scope.
 
-## ТД4 Raw `.swift` suffix checks ignore the `.graphifyrc` language override
-
-**Evidence.** These checks test the raw file name instead of `effective_suffix`, so a file
-remapped to Swift with `.graphifyrc` (for example `language.swifttpl=swift`) is not treated as
-Swift there:
-
-- `graphify/extract.py:10864`, the Swift constructor-call branch in `extract()` (cited as
-  `:10795` in review ПР8; moved on this branch).
-- `graphify/extract.py:4103`, `_swift_dotted_stub_edge` in `_rewire_unique_stub_nodes` (added
-  on this branch, same pattern).
-- `graphify/extractors/resolution.py:3587`, `_swift_type_index`.
-- `graphify/extractors/resolution.py:3826`, `swift_source_ids` in
-  `_resolve_swift_type_references`.
-
-The member-call pass was fixed in `93ffffb6`; review ПР8.
-
-**Why not here.** Pre-existing pattern outside the member-call fix that found it; each site
-needs its own regression test with a language override.
-
 ## ТД5 Extensionless scripts still reach the Python member-call pass
 
 **Evidence.** `_is_python_file` in `_resolve_python_member_calls`
