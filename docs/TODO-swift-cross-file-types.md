@@ -150,8 +150,8 @@ call on a `content` receiver in a test file (counts from a one-off run on that a
 repository). A receiver written with the same type in
 two enclosing types, or spelled `Outer.T` and `T`, is enough.
 
-A fix exists on the local branch `captain/20261023-swift-xfile-types-zd28` (head `f98dde7a`,
-not pushed). Its fail-closed rule (panel КН4) is meant to treat two writes as one type only
+A fix exists on the fork branch `captain/20261023-swift-xfile-types-zd28` (head `f98dde7a`,
+not merged, kept for reference). Its fail-closed rule (panel КН4) is meant to treat two writes as one type only
 when that is proven: the type is a struct, enum, protocol, actor or a class without an
 inheritance clause, every prefix of the path is declared in the file, and no base-class lookup
 is needed. The proof is incomplete: its typealias and generic-parameter check reads only the
