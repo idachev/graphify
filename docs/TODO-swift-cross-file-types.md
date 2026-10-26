@@ -77,16 +77,6 @@ The member-call pass was fixed in `93ffffb6`; review ПР8.
 **Why not here.** Pre-existing pattern outside the member-call fix that found it; each site
 needs its own regression test with a language override.
 
-## ТД5 Extensionless scripts still reach the Python member-call pass
-
-**Evidence.** `_is_python_file` in `_resolve_python_member_calls`
-(`graphify/extract.py:5186-5191`) lets a file with no suffix pass, so an extensionless bash or
-node script can still be a caller or target of the Python member-call pass, as before the gate.
-
-**Why not here.** Accepted risk of review ЗД26 r1 F2: the earlier shebang check read files
-relative to the working directory and could drop a real Python edge on a rebuild run outside the
-scan root; a safe check needs the scan root or the detected language passed into the pass.
-
 ## ТД6 Swift member calls bind a C/C++ namesake in a `.h` header
 
 **Evidence.** Pre-existing. The Swift member-call target gate in `_resolve_swift_member_calls`
