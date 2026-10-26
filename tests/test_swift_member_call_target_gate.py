@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import graphify.extract as extract_module
 from graphify import resolver_registry
 from graphify.extract import UNRESOLVED_CALLS_KEY, extract
 
@@ -232,16 +233,47 @@ def test_swift_call_does_not_bind_cpp_operator_in_h(tmp_path: Path):
     _assert_no_edge_into(result, _only_caller(result, use), vec)
 
 
-def test_swift_call_to_c_header_type_binds_nothing(tmp_path: Path):
-    pytest.importorskip("tree_sitter_c")
-    base = tmp_path / "src"
-    inner = _write(base / "Inner.h", (
-        "typedef struct Inner { int x; } Inner;\nvoid go(void);\n"
-    ))
-    use = _write(base / "Use.swift", "func useRun() {\n    Inner.go()\n}\n")
-    result = _run([inner, use], tmp_path)
+def _c_header_type_corpus() -> tuple[list[dict], list[dict], list[dict]]:
+    # The C extractor emits no type node for a struct, so the corpus is built at
+    # the resolver: a contained, sigil-less C type `Inner` in `Inner.h` and a
+    # Swift `Inner.go()` with no such method. Without the gate the type-only
+    # fallback binds `references useRun() -> Inner`.
+    nodes = [
+        {"id": "inner_h", "label": "Inner.h", "source_file": "src/Inner.h", "file_type": "code"},
+        {"id": "inner_h_inner", "label": "Inner", "source_file": "src/Inner.h",
+         "file_type": "code"},
+        {"id": "use_userun", "label": "useRun()", "source_file": "src/Use.swift",
+         "file_type": "code"},
+    ]
+    edges = [{"source": "inner_h", "target": "inner_h_inner", "relation": "contains",
+              "source_file": "src/Inner.h"}]
+    per_file = [{"raw_calls": [{
+        "is_member_call": True, "receiver": "Inner", "callee": "go",
+        "caller_nid": "use_userun", "source_file": "src/Use.swift", "source_location": "L2",
+    }]}]
+    return per_file, nodes, edges
 
-    _assert_no_edge_into(result, _only_caller(result, use), inner)
+
+def _resolved_into_inner(monkeypatch=None, gate=None) -> list[dict]:
+    if gate is not None:
+        monkeypatch.setattr(extract_module, "_swift_header_target_ok", gate)
+    per_file, nodes, edges = _c_header_type_corpus()
+    extract_module._resolve_swift_member_calls(per_file, nodes, edges)
+    return [
+        e for e in edges
+        if e.get("target") == "inner_h_inner" and e.get("relation") != "contains"
+    ]
+
+
+def test_swift_call_to_c_header_type_binds_nothing():
+    assert not _resolved_into_inner(), "a Swift call must not bind a C type in a `.h`"
+
+
+def test_c_header_type_corpus_reaches_the_gate(monkeypatch):
+    # Control: with the `.h` gate open, the same corpus binds the C type, so the
+    # test above fails if the gate is removed.
+    edges = _resolved_into_inner(monkeypatch, lambda *_args: True)
+    assert [e["relation"] for e in edges] == ["references"], edges
 
 
 def test_swift_call_to_methodless_objc_class_loses_type_reference(tmp_path: Path):
