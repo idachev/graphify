@@ -143,12 +143,11 @@ outside the five phases.
 
 **Evidence.** The per-file receiver table sets `scopes[name] = None` for any two writes of a
 name that differ in type or enclosing scope (АР25, fail-closed), even when both name the same
-type: `_swift_set_type_scope` in `graphify/extractors/engine.py:6434-6450`. On the supacode
-app 21 real same-file member calls bind nothing for this reason, for example
-`dragModel.reset()` in `PaneTabStripView.swift` (to `PaneTabDragModel.reset`),
-`shortcut.effective(from:)` in `AppShortcuts.swift` (to `AppShortcut.effective`) and
-`content.hibernate()` in `ContentRuntimeTests.swift` (counts from a one-off run on that app,
-outside this repository). A receiver written with the same type in
+type: `_swift_set_type_scope` in `graphify/extractors/engine.py:6434-6450`. On a private
+SwiftUI app 21 real same-file member calls bind nothing for this reason, for example a
+`reset()` call on a model in a view file, a method call on a `shortcut` receiver, and a method
+call on a `content` receiver in a test file (counts from a one-off run on that app, outside this
+repository). A receiver written with the same type in
 two enclosing types, or spelled `Outer.T` and `T`, is enough.
 
 A fix exists on the local branch `captain/20261023-swift-xfile-types-zd28` (head `f98dde7a`,
@@ -159,7 +158,7 @@ is needed. The proof is incomplete: its typealias and generic-parameter check re
 first path segment (`t.split(".")[0]` in `_swift_finish_type_scopes`, `engine.py:6354` at
 `f98dde7a`), so a later segment can still name a typealias. ЗД33 on this line does not change
 that branch. It restores 8 of the 21 calls. 5 of the 21 are real conflicts, written with different types
-(`content.hibernate` twice, `defaults.seed`, `nsView.update`, `state.syncGlobalDefaults`); they
+(one receiver name in two calls and three other receivers); they
 need receiver types scoped by the caller function, a change of the АР25 contract and of the
 `swift_type_table` record format settled in АР3/АР12.
 
