@@ -1500,6 +1500,62 @@ def _swift_nested_collision_groups(bodies, source: bytes,
     }
 
 
+def _swift_file_decl_owners(root_node, bodies: dict[str, list], source: bytes,
+                            stem: str) -> dict[str, set[tuple[str, str]]]:
+    """Plain id -> ``{(enclosing path, kind)}`` of every declaration of one Swift file.
+
+    The plain id has no salt in its chain: ``_make_id(stem, "A.B.c")`` equals
+    ``_make_id(_make_id(_make_id(stem, "A"), "B"), "c")``. A file-level
+    declaration has the enclosing path ``""``; an extension of a type not
+    declared here counts as a file-level type, as it mints that type's node.
+    A member that its sibling collision group salts is left out, as it does not
+    hold the plain id. ``bodies`` is the first result of ``_swift_nested_scan``;
+    kinds are as in ``_swift_body_members``.
+    """
+    owners: dict[str, set[tuple[str, str]]] = {}
+
+    def _add(enclosing: str, name: str, kind: str) -> None:
+        path = f"{enclosing}.{name}" if enclosing else name
+        owners.setdefault(_make_id(stem, path), set()).add((enclosing, kind))
+
+    for name, kind in _swift_body_members(root_node, source):
+        _add("", name, kind)
+    for path, path_bodies in bodies.items():
+        if "." not in path:
+            _add("", path, "type")
+        parent_nid = _make_id(stem, path)
+        groups = _swift_nested_collision_groups(path_bodies, source, parent_nid)
+        for body in path_bodies:
+            for name, kind in _swift_body_members(body, source):
+                plain = _make_id(parent_nid, name)
+                # A member its sibling group salts no longer holds the plain id.
+                if _swift_salted_member_nid(plain, name, kind, groups.get(plain)) == plain:
+                    _add(path, name, kind)
+    return owners
+
+
+def _swift_nested_type_yields(nid: str, parent_path: str,
+                              owners: dict[str, set[tuple[str, str]]]) -> bool:
+    """Whether a declaration of another scope holds a nested Swift type's id.
+
+    Joining a parent id and a name is ambiguous across scopes: ``Outer.State``,
+    a file-level ``Outer_State`` or ``outer_state()`` and ``Outer.A.B`` /
+    ``Outer.A_B`` slug to one id each, and ``add_node`` would drop the second
+    node (ТД3). The nested type yields to any member or function, to any type
+    of the same or a shallower depth and to nothing deeper, so the outcome does
+    not depend on declaration order. Siblings (same ``parent_path``) are left
+    to the collision group.
+    """
+    depth = parent_path.count(".") + 2
+    for enclosing, kind in owners.get(nid, ()):
+        if enclosing == parent_path:
+            continue
+        other_depth = enclosing.count(".") + 2 if enclosing else 1
+        if kind != "type" or other_depth <= depth:
+            return True
+    return False
+
+
 def _swift_salted_member_nid(plain_nid: str, name: str, kind: str,
                              group: set[tuple[str, str]] | None) -> str:
     """The id of a nested type or a method in one Swift collision group.
@@ -1592,6 +1648,135 @@ def _swift_pre_scan(root_node, source: bytes) -> tuple[set[str], set[str]]:
                         classes.add(text)
         stack.extend(n.children)
     return protocols, classes
+
+# A type declared under one of these nodes is local to a function, closure,
+# computed property or accessor body, not a corpus type.
+_SWIFT_LOCAL_BODY_TYPES = frozenset({
+    "function_body", "lambda_literal", "computed_property", "willset_didset_block",
+})
+
+
+def _swift_first_type_identifier(node, source: bytes) -> str | None:
+    """The text of the first ``type_identifier`` under ``node`` (pre-order)."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if n.type == "type_identifier":
+            return _read_text(n, source) or None
+        stack.extend(reversed(n.children))
+    return None
+
+
+def _swift_shadow_names(root_node, source: bytes) -> frozenset[str]:
+    """Names a written Swift receiver type cannot be proven to name.
+
+    Every simple name the file binds through something other than a non-local
+    type declaration: a typealias (generic ones too), an associatedtype, a
+    generic parameter or parameter pack of any declaration, and a type declared
+    inside a function, closure, computed-property or accessor body. The corpus
+    type index sees none of them, so a written path through such a name would
+    resolve past it to an unrelated same-named type. File-wide on purpose: a
+    write that may mean one of them binds nothing (fail closed).
+    """
+    names: set[str] = set()
+    stack = [(root_node, False)]
+    while stack:
+        n, in_body = stack.pop()
+        t = n.type
+        name: str | None = None
+        if t in ("typealias_declaration", "associatedtype_declaration", "type_parameter"):
+            name = _swift_first_type_identifier(n, source)
+        elif in_body and t in ("class_declaration", "protocol_declaration"):
+            name_node = _swift_declared_name_node(n)
+            name = _read_text(name_node, source) if name_node is not None else None
+        if name:
+            names.add(name)
+        child_in_body = in_body or t in _SWIFT_LOCAL_BODY_TYPES
+        stack.extend((c, child_in_body) for c in n.children)
+    return frozenset(names)
+
+
+def _swift_type_unproven(type_name: str, shadow_names: frozenset[str]) -> bool:
+    """True when a written receiver type may not name the declared type it spells.
+
+    A `Self`-qualified path, or any path segment that is a shadow name
+    (``_swift_shadow_names``): typealias, associatedtype, generic parameter or
+    local type.
+    """
+    segments = type_name.split(".")
+    return segments[0] == "Self" or any(s in shadow_names for s in segments)
+
+
+def _swift_annotation_unproven(type_node, source: bytes, shadow_names: frozenset[str]) -> bool:
+    """True when a written type annotation does not record a proven type."""
+    refs: list[tuple[str, str]] = []
+    _swift_collect_type_refs(type_node, source, False, refs)
+    recorded = next((name for name, role in refs if role == "type"), None)
+    return recorded is None or _swift_type_unproven(recorded, shadow_names)
+
+
+def _swift_initializer_unproven(init_node, source: bytes, shadow_names: frozenset[str]) -> bool:
+    """True when a binding's initializer names its type through an unproven path.
+
+    `let x = T()`, `let x = T.shared` and the factory `let x = T.make()`.
+    """
+    written: str | None = None
+    if init_node.type == "call_expression":
+        written = _swift_constructor_type(init_node, source)
+        if written is None:
+            factory = _swift_factory_call(init_node, source)
+            written = factory[0] if factory else None
+    elif init_node.type == "navigation_expression":
+        written = _swift_navigation_type_head(init_node, source)
+    return written is not None and _swift_type_unproven(written, shadow_names)
+
+
+def _swift_unproven_bindings(root_node, source: bytes,
+                             shadow_names: frozenset[str]) -> list[str]:
+    """Names of Swift bindings anywhere in the file whose written type is unproven.
+
+    Negative facts only, for the binding sites the receiver table does not read:
+    every name of a (protocol) property declaration at any level (file scope,
+    type member, local; `var a, b: T` and `var a: T, b: U` included) whose
+    annotation records no proven type, or whose declaration has an initializer
+    through an unproven type (annotated or not), and every typed closure parameter
+    whose type is unproven. Untyped bindings are not listed.
+    """
+    names: list[str] = []
+    stack = [root_node]
+    while stack:
+        n = stack.pop()
+        if n.type in ("property_declaration", "protocol_property_declaration"):
+            pending: list[str] = []
+            declared: list[str] = []
+            for c in n.children:
+                if c.type == "pattern":
+                    name_node = next(
+                        (sc for sc in c.children if sc.type == "simple_identifier"), None
+                    )
+                    if name_node is not None and _read_text(name_node, source):
+                        pending.append(_read_text(name_node, source))
+                        declared.append(pending[-1])
+                elif c.type == "type_annotation":
+                    if _swift_annotation_unproven(c, source, shadow_names):
+                        names.extend(pending)
+                    pending = []
+                elif declared and _swift_initializer_unproven(c, source, shadow_names):
+                    # Checked even under an annotation (`let x: any P =
+                    # Box.make()`): every name of the declaration is unknown.
+                    names.extend(declared)
+        elif n.type == "lambda_parameter":
+            idents = [c for c in n.children if c.type == "simple_identifier"]
+            type_node = next(
+                (c for c in n.children if c.is_named
+                 and c.type not in ("simple_identifier", "parameter_modifiers")), None,
+            )
+            if (idents and type_node is not None
+                    and _swift_annotation_unproven(type_node, source, shadow_names)):
+                names.append(_read_text(idents[-1], source))
+        stack.extend(n.children)
+    return names
+
 
 def _swift_classify_base(name: str, kind: str | None, is_first: bool,
                           protocols: set[str], classes: set[str]) -> str:
@@ -6228,7 +6413,7 @@ def _extract_generic(
     swift_protocol_names: set[str] = set()
     swift_class_names: set[str] = set()
     # Qualified path of each enclosing Swift type (or extended type) during the
-    # walk, innermost last (`["LayoutFeature", "LayoutFeature.State"]`). A stack,
+    # walk, innermost last (`["BoardFeature", "BoardFeature.State"]`). A stack,
     # not a nid -> path map: two same-named nested types can share one id, and
     # their members must still see the path of the declaration they sit in.
     swift_scope_stack: list[str] = []
@@ -6242,10 +6427,22 @@ def _extract_generic(
     # name -> (type, scope) of its first `type_table` write ("" = file scope).
     swift_type_first_writes: dict[str, tuple[str, str]] = {}
 
-    def _swift_set_type_scope(name: str, type_name: str, scope: str) -> None:
+    # Names a written receiver type cannot be proven to name (typealias,
+    # associatedtype, generic parameter, local type), filled by the pre-scan.
+    swift_shadow_names: frozenset[str] = frozenset()
+
+    def _swift_set_type_scope(name: str, type_name: str | None, scope: str) -> None:
         # Called for every Swift `type_table[name]` write. The table is flat per
         # file, so two writes that disagree make the name's scope unknown; the
         # None sticks even when a later write agrees with the first one.
+        # A written type that is not proven to name the declared type it spells
+        # (`type_name` None: a `Self.X` or generic-parameter annotation the table
+        # skips; or a path through a shadow name) makes the scope unknown at
+        # once, file scope included: the in-file bind and the corpus resolver
+        # then bind nothing for the name.
+        if type_name is None or _swift_type_unproven(type_name, swift_shadow_names):
+            swift_type_scopes[name] = None
+            return
         first = swift_type_first_writes.setdefault(name, (type_name, scope))
         if first != (type_name, scope):
             swift_type_scopes[name] = None
@@ -6254,23 +6451,35 @@ def _extract_generic(
 
     if config.ts_module == "tree_sitter_swift":
         swift_protocol_names, swift_class_names = _swift_pre_scan(root, source)
+        swift_shadow_names = _swift_shadow_names(root, source)
 
     # JS/TS class body -> member collision groups, filled lazily (#4475).
     js_member_groups: dict = {}
     # Swift nested type / member ids (RFC Phase 3): the file's type bodies by
-    # qualified path, scanned once on first use; collision groups per (parent
-    # path, parent nid); the nid minted for each qualified path.
+    # qualified path and the owners of each plain id, scanned once on first use;
+    # collision groups per (parent path, parent nid); the nid minted for each
+    # qualified path.
     swift_nested_plan: list = []
     swift_nested_groups: dict = {}
     swift_path_nids: dict[str, str] = {}
+    # Qualified path -> nid of each nested type salted because a declaration of
+    # another scope holds its plain id (ТД3), for written references to it.
+    swift_cross_salted: dict[str, str] = {}
+
+    def _swift_ensure_nested_plan() -> None:
+        # [bodies, nested, plain id owners], scanned once on first use.
+        if not swift_nested_plan:
+            swift_nested_plan.extend(_swift_nested_scan(root, source))
+            swift_nested_plan.append(
+                _swift_file_decl_owners(root, swift_nested_plan[0], source, stem)
+            )
 
     def _swift_member_nid(parent_path: str | None, parent_nid: str, name: str,
                           kind: str) -> str:
         plain = _make_id(parent_nid, name)
         if parent_path is None:
             return plain
-        if not swift_nested_plan:
-            swift_nested_plan.extend(_swift_nested_scan(root, source))
+        _swift_ensure_nested_plan()
         key = (parent_path, parent_nid)
         groups = swift_nested_groups.get(key)
         if groups is None:
@@ -6278,12 +6487,17 @@ def _extract_generic(
                 swift_nested_plan[0].get(parent_path, []), source, parent_nid
             )
             swift_nested_groups[key] = groups
-        return _swift_salted_member_nid(plain, name, kind, groups.get(plain))
+        nid = _swift_salted_member_nid(plain, name, kind, groups.get(plain))
+        if kind == "type" and _swift_nested_type_yields(nid, parent_path, swift_nested_plan[2]):
+            # A declaration of another scope holds the id (ТД3).
+            tagged = f"nested:{parent_path}.{name}".encode("utf-8")
+            nid = _make_id(nid, hashlib.sha1(tagged, usedforsecurity=False).hexdigest()[:6])
+            swift_cross_salted[f"{parent_path}.{name}"] = nid
+        return nid
 
     def _swift_nested_path_nid(path: str) -> str | None:
         """The nid of the nested type declared at ``path`` in this file, else None."""
-        if not swift_nested_plan:
-            swift_nested_plan.extend(_swift_nested_scan(root, source))
+        _swift_ensure_nested_plan()
         entry = swift_nested_plan[1].get(path)
         if entry is None:
             return None
@@ -6349,6 +6563,12 @@ def _extract_generic(
         edges.append(edge)
 
     def ensure_named_node(name: str, line: int) -> str:
+        if config.ts_module == "tree_sitter_swift" and "." in name:
+            # `Outer.State` slugs to the plain id that a file-level `Outer_State`
+            # holds when the nested type got the ТД3 salt.
+            _swift_nested_path_nid(name)
+            if name in swift_cross_salted:
+                return swift_cross_salted[name]
         nid = _make_id(stem, ".".join(namespace_stack), name)
         if config.ts_module == "tree_sitter_c_sharp":
             nid = _underscore_salted_nid(nid, name, csharp_type_groups)
@@ -7725,6 +7945,7 @@ def _extract_generic(
                         add_edge(parent_class_nid, target_nid, "references", line, context=ctx)
                     if prop_type is None and role == "type":
                         prop_type = ref_name
+            annotated_unknown = type_anno is not None and prop_type is None
             # #1356 Stage 1: walk the initializer so a constructor call
             # (`let vm = VM()`) produces a calls edge. #1356 Stage 2a: when the
             # property has no type annotation, infer its type from the
@@ -7757,7 +7978,11 @@ def _extract_generic(
             if prop_type is None:
                 prop_type = _swift_attribute_type_name(node, source)
             prop_name = _swift_property_name(node, source)
-            if prop_name and prop_type:
+            if prop_name and annotated_unknown:
+                # `var x: Self.State` / `var x: T`: the annotation names a type
+                # the table cannot record; the name's type is unknown.
+                _swift_set_type_scope(prop_name, None, "")
+            elif prop_name and prop_type:
                 type_table[prop_name] = prop_type
                 _swift_set_type_scope(
                     prop_name, prop_type, swift_scope_stack[-1] if swift_scope_stack else "",
@@ -8293,10 +8518,14 @@ def _extract_generic(
                     # #1356 Stage 2a: record param name -> type (flat per-file
                     # table; later params with the same name win, which is fine
                     # for the depth-1 member-call resolution we do).
-                    if param_type:
+                    # A typed parameter whose type the table cannot record
+                    # (`Self.State`, a generic `T`) is an unknown-type write.
+                    if param_type or type_node is not None:
                         name_node = p.child_by_field_name("name")
                         pname = _read_text(name_node, source) if name_node else None
-                        if pname:
+                        if pname and not param_type:
+                            _swift_set_type_scope(pname, None, "")
+                        elif pname:
                             type_table[pname] = param_type
                             _swift_set_type_scope(
                                 pname, param_type,
@@ -10510,6 +10739,12 @@ def _extract_generic(
             body_scope = swift_body_scopes.get(id(body_node), "")
             for local_name, local_type in body_bindings:
                 _swift_set_type_scope(local_name, local_type, body_scope)
+        # Binding sites the table does not read (typed locals, typed closure
+        # parameters, every name of a multi-binding property, file-scope
+        # bindings, a factory local shadowing a recorded name) still make an
+        # unproven name unknown, before walk_calls reads the scopes.
+        for unproven_name in _swift_unproven_bindings(root, source, swift_shadow_names):
+            _swift_set_type_scope(unproven_name, None, "")
 
     # JS/TS: bodies already walked with their own caller_nid (const-assigned
     # arrows, methods). An INLINE/returned arrow or function-expression that is
@@ -10728,7 +10963,8 @@ def _extract_generic(
     if config.ts_module == "tree_sitter_php":
         _php_receiver_type_table(root, source, type_table)
     if config.ts_module == "tree_sitter_swift":
-        if type_table or swift_factory_bindings:
+        # A scopes-only result (every write rejected) still ships its None.
+        if type_table or swift_factory_bindings or swift_type_scopes:
             result["swift_type_table"] = {
                 "path": str_path, "table": type_table, "scopes": swift_type_scopes,
             }

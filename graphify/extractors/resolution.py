@@ -3564,11 +3564,21 @@ def _resolve_cross_file_java_imports(
 class SwiftTypeIndex(NamedTuple):
     """Swift module symbol table rebuilt from node attributes (no hand-off)."""
 
-    # qualified path ("PaneLayout.Pane") -> distinct node ids, sorted
+    # qualified path ("Board.Tile") -> distinct node ids, sorted
     by_path: dict[str, list[str]]
-    # last path segment ("Pane") -> node ids, sorted; a node declared under 2+
+    # last path segment ("Tile") -> node ids, sorted; a node declared under 2+
     # paths appears that many times under each of its last segments
     by_label: dict[str, list[str]]
+
+
+def _is_swift_source(source_file: object) -> bool:
+    """True when ``source_file`` is Swift: its effective suffix is ``.swift``.
+
+    The effective suffix honours a ``.graphifyrc`` language override, and the
+    comparison ignores case, so ``View.swifttpl`` remapped to Swift and
+    ``View.SWIFT`` both count.
+    """
+    return effective_suffix(str(source_file or "")).lower() == ".swift"
 
 
 def _swift_type_index(nodes: list[dict]) -> SwiftTypeIndex:
@@ -3584,7 +3594,7 @@ def _swift_type_index(nodes: list[dict]) -> SwiftTypeIndex:
         nid = node.get("id")
         if not qualified or not nid or node.get("_swift_extension_only"):
             continue
-        if not str(node.get("source_file") or "").endswith(".swift"):
+        if not _is_swift_source(node.get("source_file")):
             continue
         if isinstance(qualified, str):
             qualified = [qualified]
@@ -3823,7 +3833,7 @@ def _resolve_swift_type_references(
     swift_source_ids = {
         node.get("id") for node in all_nodes + (resolution_context_nodes or [])
         if node.get("id")
-        and str(node.get("source_file") or "").lower().endswith(".swift")
+        and _is_swift_source(node.get("source_file"))
     }
     stub_labels = {
         node["id"]: str(node.get("label") or "")
