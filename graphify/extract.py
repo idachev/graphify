@@ -4693,6 +4693,8 @@ def _resolve_swift_member_calls(
     # extension folded onto it, are called from Swift). A Python `Inner.go()`
     # is never a Swift target. The language comes from the node's file through
     # `effective_suffix`, so a `.graphifyrc` remap to Swift counts as Swift.
+    # A `.h` type stays a candidate and rival here; `_swift_header_target_ok`
+    # admits the bind only for ObjC (sigil method, or a type owning one).
     swift_target_suffixes = frozenset({".swift", ".m", ".mm", ".h"})
 
     def _is_swift_target(node: dict | None) -> bool:
@@ -4714,6 +4716,7 @@ def _resolve_swift_member_calls(
     # (type_node_id, method_key) -> method_node_id, from `method` edges.
     method_index: dict[tuple[str, str], str] = {}
     method_owner: dict[str, str] = {}  # method nid -> owning type nid
+    methods_of: dict[str, list[str]] = {}  # type nid -> its method nids
     for e in all_edges:
         if e.get("relation") != "method":
             continue
@@ -4722,6 +4725,7 @@ def _resolve_swift_member_calls(
         if tnode is not None and src is not None and tgt is not None:
             method_index[(src, _key(tnode.get("label", "")))] = tgt
             method_owner[tgt] = src
+            methods_of.setdefault(src, []).append(tgt)
 
     # #2561: pending factory bindings (`let x = Factory.make()`) are label-only —
     # resolve each against the factory method's marked plain return type
@@ -4952,6 +4956,10 @@ def _resolve_swift_member_calls(
             # The type is a Swift target, but the method edge points into
             # another language: bind nothing rather than cross languages.
             continue
+        if not _swift_header_target_ok(
+                node_by_id.get(target), methods_of.get(target, []), node_by_id):
+            # A C or C++ namesake in a `.h` header is not a Swift target.
+            continue
         if target == caller or (caller, target) in existing_pairs:
             continue
         existing_pairs.add((caller, target))
@@ -4970,6 +4978,25 @@ def _resolve_swift_member_calls(
             "source_location": rc.get("source_location"),
             "weight": 1.0,
         })
+
+
+def _swift_header_target_ok(
+    node: dict | None, owned_methods: list[str], node_by_id: dict[str, dict],
+) -> bool:
+    """Whether a Swift member call may bind ``node`` when it lives in a ``.h``.
+
+    A ``.h`` header is C, C++ or Objective-C, and only Objective-C is a Swift
+    target there (Swift<->ObjC interop, #1556). An ObjC method label carries a
+    ``+``/``-`` sigil (``extract_objc``); C and C++ labels never do. So a ``.h``
+    target is admitted only as an ObjC method or as a type that owns one; any
+    other ``.h`` target fails closed, which also drops a type-only ``references``
+    edge to an ObjC class with no ObjC method in the corpus. A target in any
+    other file passes.
+    """
+    if effective_suffix((node or {}).get("source_file") or "").lower() != ".h":
+        return True
+    candidates = [node, *(node_by_id.get(m) for m in owned_methods)]
+    return any(str((n or {}).get("label", ""))[:1] in ("-", "+") for n in candidates)
 
 
 def _swift_caller_scope(
@@ -5024,6 +5051,57 @@ def _stamp_python_fixture_paths(per_file: "list[dict | None]", root: Path) -> No
             result["_python_fixture_files"] = located
 
 
+def _script_is_python(path: Path) -> "bool | None":
+    """The language of an extensionless script, by its shebang, as extraction
+    decides it; None (unknown) when there is no readable shebang or its
+    interpreter maps to no extractor."""
+    from graphify.detect import _shebang_interpreter
+    interp = _shebang_interpreter(path)
+    extractor = _SHEBANG_DISPATCH.get(interp) if interp is not None else None
+    if extractor is None:
+        return None
+    return extractor is extract_python
+
+
+def _stamp_script_languages(
+    per_file: "list[dict | None]",
+    paths: "list[Path]",
+    context_nodes: "list[dict] | None",
+    root: Path,
+) -> None:
+    """Python or not, per extensionless source_file, for the language gate of
+    _resolve_python_member_calls. Re-extracted files are read through the path
+    extract() was given; an unchanged file's context node through the scan root,
+    never the working directory. Unknown files get no entry. The map rides on the
+    first result, in memory only (results were cached before resolution), and no
+    context node is touched."""
+    languages: dict[str, bool] = {}
+    first: "dict | None" = None
+    for result, path in zip(per_file, paths):
+        if not result:
+            continue
+        first = first or result
+        if effective_suffix(path):
+            continue
+        is_python = _script_is_python(path)
+        if is_python is None:
+            continue
+        files = {str(path)}
+        files.update(str(n["source_file"]) for n in result.get("nodes", []) if n.get("source_file"))
+        files.update(str(rc["source_file"]) for rc in result.get("raw_calls", []) if rc.get("source_file"))
+        languages.update(dict.fromkeys(files, is_python))
+    context_files = {str(n["source_file"]) for n in context_nodes or [] if n.get("source_file")}
+    for source_file in context_files - languages.keys():
+        if effective_suffix(source_file):
+            continue
+        location = Path(source_file)
+        is_python = _script_is_python(location if location.is_absolute() else root / location)
+        if is_python is not None:
+            languages[source_file] = is_python
+    if first is not None and languages:
+        first["_script_python"] = languages
+
+
 def _resolve_python_member_calls(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -5047,12 +5125,19 @@ def _resolve_python_member_calls(
     def _key(label: str) -> str:
         return re.sub(r"[^a-zA-Z0-9]+", "", str(label)).lower()
 
+    # Extensionless scripts whose shebang was read (_stamp_script_languages).
+    script_python: dict[str, bool] = {}
+    for result in per_file:
+        script_python.update(result.get("_script_python") or {})
+
     def _is_python_file(source_file: object) -> bool:
         # The effective suffix honours a `.graphifyrc` language override. An
-        # extensionless file (a shebang script) or a raw call that names no file
-        # is unknown and passes, as before the gate.
+        # extensionless file is Python when its shebang says so; one with no
+        # readable shebang, or a raw call that names no file, is unknown and passes.
         suffix = effective_suffix(str(source_file or "")).lower()
-        return not suffix or suffix in (".py", ".pyi")
+        if not suffix:
+            return script_python.get(str(source_file or ""), True)
+        return suffix in (".py", ".pyi")
 
     node_by_id: dict[str, dict] = {n.get("id"): n for n in all_nodes}
 
@@ -7740,8 +7825,10 @@ register_language_resolver(
 register_language_resolver(
     LanguageResolver("swift_member_calls", frozenset({".swift"}), _resolve_swift_member_calls)
 )
+# `""` wakes the Python pass for a changed extensionless script too; its language
+# gate (_stamp_script_languages) keeps non-Python shebang scripts out.
 register_language_resolver(
-    LanguageResolver("python_member_calls", frozenset({".py"}), _resolve_python_member_calls)
+    LanguageResolver("python_member_calls", frozenset({".py", ""}), _resolve_python_member_calls)
 )
 # Ruby type-aware member-call resolution (Class.new + typed var.method). Lives in
 # graphify.ruby_resolution; registered here as a second consumer of the framework.
@@ -11237,6 +11324,7 @@ def extract(
     # unchanged file is ever emitted, and the ambiguity guards count the same
     # candidates a full build would (the context is the whole unchanged corpus).
     _stamp_python_fixture_paths(per_file, root)
+    _stamp_script_languages(per_file, paths, resolution_context_nodes, root)
     if resolution_context_nodes or resolution_context_edges:
         _rl_nodes = list(resolution_nodes)
         _rl_edges = all_edges + list(resolution_context_edges or [])
