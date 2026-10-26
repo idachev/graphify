@@ -97,9 +97,15 @@ the file's bare-label map (`label_to_nid.get(callee_name)`, `engine.py:9967`), s
 same-named `go` of another type in the same file. The АР25 guard (`engine.py:9992-9999`) covers
 only conflicting writes.
 
-**Why not here.** Pre-existing behaviour outside the documented phases. The unmerged ЗД28
-branch (ТД10) narrows the bind to a method of the receiver's type only for agreed same-type
-writes, and it is not on this branch.
+A typed receiver whose type identity is unproven (a `Self.State` or generic-parameter
+annotation, or a path through a typealias, associatedtype or local type) binds nothing since
+ЗД33: its write sets the name's scope to None and the АР25 guard stops the bare-label bind.
+Still open: a single proven write (`x: First` binds `x.go()` to a `Second.go` declared later in
+the file), the last-segment type compare (Codex ТД8 F2) and the case-folded method keys of the
+resolver (F3). Untyped receivers and chains are unchanged.
+
+**Why not here.** Pre-existing behaviour outside the documented phases. The full fix must prove
+the receiver's owner for every write or bind nothing, with tests for swapped declaration order.
 
 ## ТД9 Inherited methods are not looked up by the Swift member-call resolver
 
@@ -131,28 +137,15 @@ It restores 8 of the 21 calls. 5 of the 21 are real conflicts, written with diff
 need receiver types scoped by the caller function, a change of the АР25 contract and of the
 `swift_type_table` record format settled in АР3/АР12.
 
-A fourth review of `f98dde7a` found three more inputs where the branch binds a call to a
-different type than the receiver's, while this branch binds nothing (each reproduced with
-`extract()` on both commits):
-
-- F1, qualified typealias: `struct Other { func go() {} }; struct Box { struct State { func go() {} } };
-  struct A { struct Box { typealias State = Other }; func a(_ x: Box.State) { x.go() } };
-  struct B { func b(_ x: Box.State) { x.go() } }` binds `A.a` to the global `Box.State.go`.
-  Only the first segment of the path is checked for a typealias.
-- F2, associated type: `protocol P { func go() }; struct State { func go() {} };
-  protocol A { associatedtype State: P }; extension A { func a(_ x: State) { x.go() } };
-  struct B { func b(_ x: State) { x.go() } }` binds `A.a` to the global `State.go`.
-- H2, local type: a `struct State` declared inside a function body binds to the global `State`.
-
-The cause is an open deny-list: the proof rejects only a typealias or a generic parameter on the
-first segment, so every other declaration kind and every later segment passes. A closed rule
-would fix all three: a write is unproven when any segment of its type is bound by anything other
-than a non-local struct, enum, protocol, actor or class declared in the file (typealias,
-associatedtype, generic parameters of types, functions, initializers, subscripts, macros and
-generic typealiases, parameter packs, local types). A simulation of that rule kept the 8
-restored calls on the real app (951 of 951 edges on 13 copied files). Three older holes exist
-on both commits and are not covered by it: `Self.State`, `<Box: Q> Box.State`, and
-`A<State>` with `State?`.
+The single-write wrong edges found while revalidating the fourth review of `f98dde7a` are
+fixed on this line by ЗД33 (`tests/test_swift_receiver_fail_closed.py`): a receiver write whose
+written type goes through a typealias, associatedtype, generic parameter or parameter pack, a
+local type or a `Self`-qualified path, or whose annotation the table cannot record, sets
+`scopes[name] = None` at once, so the in-file bind and the corpus resolver bind nothing
+(X_F1, X_F1b, X_F2, X_H2, and the older `Self.State`, `<Box: Q> Box.State`, `A<State>` with
+`State?`). The rule is file-wide, so it also blocks correct calls through a colliding name.
+The recovery of the 21 calls stays deferred: the caller-scoped receiver type with the closed
+rule (Codex revalidation, design B+A) is not closed yet.
 
 **Why not here.** Each review round of ЗД28 found new holes in the same proof check (4, 2, 1,
 then 2 plus one found while checking them), and a wrong edge is worse than a missing one. Panel

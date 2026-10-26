@@ -1,0 +1,316 @@
+"""Swift receiver writes whose type is not proven bind nothing (ЗД33).
+
+A receiver write through a typealias, associatedtype, generic parameter, local
+type or a `Self`-qualified path names a type the corpus type index cannot see,
+so the old code resolved past it to an unrelated same-named type. The extractor
+now rejects such a write at once (sticky `scopes[name] = None`, АР25 semantics):
+the in-file bare-label bind and the corpus resolver bind nothing for the name,
+and nothing is parked. Each input below bound a wrong edge on 0c7165fc
+(`reports/reval-ТД10.md`, ЕВ2/ЕВ4); the plain-struct control and the cache
+round-trip are guards.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from graphify.extract import extract, extract_swift
+
+# Callees declared only here: the call in M.swift goes through the corpus resolver.
+LIB = (
+    "protocol P { func go() }\n"
+    "struct Other { func go() {} }\n"
+    "struct Box { struct State { func go() {} } }\n"
+    "struct State { func go() {} }\n"
+)
+
+# name -> (M.swift source, Lib.swift needed, labels of the callers to check)
+CASES = {
+    "X_F1_qualified_typealias": (
+        "struct A {\n"
+        "    struct Box { typealias State = Other }\n"
+        "    func a(_ x: Box.State) {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n",
+        True, [".a()"]),
+    "X_F1b_plain_typealias": (
+        "struct A {\n"
+        "    typealias State = Other\n"
+        "    func a(_ x: State) {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n",
+        True, [".a()"]),
+    "X_F2_associatedtype": (
+        "protocol A { associatedtype State: P }\n"
+        "extension A {\n"
+        "    func a(_ x: State) {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n",
+        True, [".a()"]),
+    "X_H2_local_struct": (
+        "struct A {\n"
+        "    func a() {\n"
+        "        struct State { func go() {} }\n"
+        "        let x = State()\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n",
+        True, [".a()"]),
+    # H3: the wrong edge was B.b -> A.State.go through the in-file bare label.
+    "H3_Self_qualified": (
+        "struct State { func go() {} }\n"
+        "struct A {\n"
+        "    struct State { func go() {} }\n"
+        "    func a(_ x: Self.State) {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+        "struct B {\n"
+        "    func b(_ x: State) {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n",
+        False, [".b()"]),
+    "H5_func_generic_Box_State": (
+        "protocol P { func go() }\n"
+        "struct Box { struct State { func go() {} } }\n"
+        "protocol Q { associatedtype State: P }\n"
+        "struct A {\n"
+        "    func a<Box: Q>(_ x: Box.State) {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+        "struct B {\n"
+        "    func b(_ x: Box.State) {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n",
+        False, [".a()"]),
+    "H5b_func_generic_single_write": (
+        "protocol P { func go() }\n"
+        "struct Box { struct State { func go() {} } }\n"
+        "protocol Q { associatedtype State: P }\n"
+        "struct A {\n"
+        "    func a<Box: Q>(_ x: Box.State) {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n",
+        False, [".a()"]),
+    "H8_type_generic_optional": (
+        "protocol P { func go() }\n"
+        "struct State { func go() {} }\n"
+        "struct A<State: P> {\n"
+        "    func a(_ x: State?) {\n"
+        "        x?.go()\n"
+        "    }\n"
+        "}\n"
+        "struct B {\n"
+        "    func b(_ x: State) {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n",
+        False, [".a()"]),
+    "H8b_type_generic_plain_single_write": (
+        "protocol P { func go() }\n"
+        "struct State { func go() {} }\n"
+        "struct A<State: P> {\n"
+        "    func a(_ x: State) {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n",
+        False, [".a()"]),
+}
+
+
+def _write(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _run(files: list[Path], tmp_path: Path) -> dict:
+    return extract(files, cache_root=tmp_path / "cache", root=tmp_path / "src", parallel=False)
+
+
+def _corpus(tmp_path: Path, source: str, with_lib: bool) -> tuple[list[Path], Path]:
+    base = tmp_path / "src"
+    main = _write(base / "M.swift", source)
+    files = [main]
+    if with_lib:
+        files.insert(0, _write(base / "Lib.swift", LIB))
+    return files, main
+
+
+def _call_lines(source: str) -> set[str]:
+    return {
+        f"L{i}" for i, line in enumerate(source.splitlines(), start=1)
+        if "x.go()" in line or "x?.go()" in line
+    }
+
+
+def _protocol_methods(result: dict, protocol: str) -> set[str]:
+    by_id = {n["id"]: n for n in result["nodes"]}
+    return {
+        e["target"] for e in result["edges"]
+        if e.get("relation") == "method"
+        and by_id.get(e.get("source"), {}).get("label") == protocol
+    }
+
+
+def _callers(result: dict, label: str, main: Path) -> list[dict]:
+    return [
+        n for n in result["nodes"]
+        if n.get("label") == label and str(n.get("source_file", "")).endswith(main.name)
+    ]
+
+
+@pytest.mark.parametrize("case", sorted(CASES))
+def test_unproven_receiver_type_binds_nothing(tmp_path: Path, case: str):
+    source, with_lib, caller_labels = CASES[case]
+    files, main = _corpus(tmp_path, source, with_lib)
+    result = _run(files, tmp_path)
+
+    lines = _call_lines(source)
+    # A constrained generic or an associatedtype `State: P` really dispatches
+    # through P, so a P.go target would not be wrong; nothing else may bind.
+    allowed = _protocol_methods(result, "P")
+    for label in caller_labels:
+        callers = _callers(result, label, main)
+        assert callers, f"{case}: caller {label} not extracted"
+        for caller in callers:
+            wrong = [
+                e for e in result["edges"]
+                if e.get("source") == caller["id"]
+                and e.get("relation") in ("calls", "references")
+                and e.get("source_location") in lines
+                and e.get("target") not in allowed
+            ]
+            assert not wrong, f"{case}: {label} x.go() bound {wrong}"
+            parked = (caller.get("metadata") or {}).get("unresolved_calls") or []
+            assert not [p for p in parked if isinstance(p, dict) and p.get("callee") == "go"], (
+                f"{case}: {label} parked x.go(): {parked}"
+            )
+
+
+@pytest.mark.parametrize("case", sorted(CASES))
+def test_unproven_receiver_write_is_recorded_as_unknown(tmp_path: Path, case: str):
+    # The rejection is a fact of the per-file result, scopes-only files included
+    # (a rejected generic parameter leaves the table empty).
+    source, with_lib, _labels = CASES[case]
+    _files, main = _corpus(tmp_path, source, with_lib)
+    table = extract_swift(main).get("swift_type_table")
+
+    assert table is not None
+    assert "x" in table["scopes"] and table["scopes"]["x"] is None
+
+
+def test_plain_struct_receiver_still_binds_same_file(tmp_path: Path):
+    source = (
+        "struct A { func go() {} }\n"
+        "struct C {\n"
+        "    var x: A\n"
+        "    func run() {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+    )
+    files, main = _corpus(tmp_path, source, False)
+    result = _run(files, tmp_path)
+
+    by_id = {n["id"]: n for n in result["nodes"]}
+    a_go = {
+        e["target"] for e in result["edges"]
+        if e.get("relation") == "method" and by_id.get(e["source"], {}).get("label") == "A"
+    }
+    run = _callers(result, ".run()", main)
+    assert len(run) == 1 and len(a_go) == 1
+    assert any(
+        e.get("source") == run[0]["id"] and e.get("relation") == "calls"
+        and e.get("target") in a_go
+        for e in result["edges"]
+    )
+
+
+def test_plain_struct_receiver_still_binds_cross_file(tmp_path: Path):
+    base = tmp_path / "src"
+    lib = _write(base / "A.swift", "struct A { func go() {} }\n")
+    main = _write(base / "M.swift", (
+        "struct C {\n"
+        "    var x: A\n"
+        "    func run() {\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n"
+    ))
+    result = _run([lib, main], tmp_path)
+
+    by_id = {n["id"]: n for n in result["nodes"]}
+    a_go = {
+        e["target"] for e in result["edges"]
+        if e.get("relation") == "method" and by_id.get(e["source"], {}).get("label") == "A"
+    }
+    run = _callers(result, ".run()", main)
+    assert len(run) == 1 and len(a_go) == 1
+    assert any(
+        e.get("source") == run[0]["id"] and e.get("relation") == "calls"
+        and e.get("target") in a_go
+        for e in result["edges"]
+    )
+
+
+def _cached_type_tables(cache: Path) -> list[dict]:
+    tables = []
+    for path in cache.rglob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("swift_type_table"), dict):
+            tables.append(payload["swift_type_table"])
+    return tables
+
+
+def test_rejection_survives_cache_round_trip(tmp_path: Path):
+    # A scopes-only result (the generic-parameter write is rejected, the table is
+    # empty) and a single-write typealias result keep their None through the AST
+    # cache, and the cached second run binds no wrong edge either.
+    source, _with_lib, _labels = CASES["H8b_type_generic_plain_single_write"]
+    alias_source, _with_lib, _labels = CASES["X_F1b_plain_typealias"]
+    base = tmp_path / "src"
+    lib = _write(base / "Lib.swift", LIB)
+    generic = _write(base / "M.swift", source)
+    alias = _write(base / "N.swift", alias_source)
+    files = [lib, generic, alias]
+
+    first = _run(files, tmp_path)
+    tables = _cached_type_tables(tmp_path / "cache")
+    unknown = [t for t in tables if (t.get("scopes") or {}).get("x", "") is None]
+    assert len(unknown) == 2, tables
+    assert any(not t.get("table") for t in unknown), "scopes-only result not cached"
+
+    second = _run(files, tmp_path)
+
+    def _edges(result: dict) -> set[tuple]:
+        return {
+            (e.get("source"), e.get("target"), e.get("relation"), e.get("source_location"))
+            for e in result["edges"]
+        }
+
+    assert _edges(second) == _edges(first)
+    for result in (first, second):
+        for main, src in ((generic, source), (alias, alias_source)):
+            lines = _call_lines(src)
+            allowed = _protocol_methods(result, "P")
+            for caller in _callers(result, ".a()", main):
+                assert not [
+                    e for e in result["edges"]
+                    if e.get("source") == caller["id"]
+                    and e.get("relation") in ("calls", "references")
+                    and e.get("source_location") in lines
+                    and e.get("target") not in allowed
+                ]

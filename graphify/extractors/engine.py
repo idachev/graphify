@@ -1593,6 +1593,64 @@ def _swift_pre_scan(root_node, source: bytes) -> tuple[set[str], set[str]]:
         stack.extend(n.children)
     return protocols, classes
 
+# A type declared under one of these nodes is local to a function, closure,
+# computed property or accessor body, not a corpus type.
+_SWIFT_LOCAL_BODY_TYPES = frozenset({
+    "function_body", "lambda_literal", "computed_property", "willset_didset_block",
+})
+
+
+def _swift_first_type_identifier(node, source: bytes) -> str | None:
+    """The text of the first ``type_identifier`` under ``node`` (pre-order)."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if n.type == "type_identifier":
+            return _read_text(n, source) or None
+        stack.extend(reversed(n.children))
+    return None
+
+
+def _swift_shadow_names(root_node, source: bytes) -> frozenset[str]:
+    """Names a written Swift receiver type cannot be proven to name.
+
+    Every simple name the file binds through something other than a non-local
+    type declaration: a typealias (generic ones too), an associatedtype, a
+    generic parameter or parameter pack of any declaration, and a type declared
+    inside a function, closure, computed-property or accessor body. The corpus
+    type index sees none of them, so a written path through such a name would
+    resolve past it to an unrelated same-named type. File-wide on purpose: a
+    write that may mean one of them binds nothing (fail closed).
+    """
+    names: set[str] = set()
+    stack = [(root_node, False)]
+    while stack:
+        n, in_body = stack.pop()
+        t = n.type
+        name: str | None = None
+        if t in ("typealias_declaration", "associatedtype_declaration", "type_parameter"):
+            name = _swift_first_type_identifier(n, source)
+        elif in_body and t in ("class_declaration", "protocol_declaration"):
+            name_node = _swift_declared_name_node(n)
+            name = _read_text(name_node, source) if name_node is not None else None
+        if name:
+            names.add(name)
+        child_in_body = in_body or t in _SWIFT_LOCAL_BODY_TYPES
+        stack.extend((c, child_in_body) for c in n.children)
+    return frozenset(names)
+
+
+def _swift_type_unproven(type_name: str, shadow_names: frozenset[str]) -> bool:
+    """True when a written receiver type may not name the declared type it spells.
+
+    A `Self`-qualified path, or any path segment that is a shadow name
+    (``_swift_shadow_names``): typealias, associatedtype, generic parameter or
+    local type.
+    """
+    segments = type_name.split(".")
+    return segments[0] == "Self" or any(s in shadow_names for s in segments)
+
+
 def _swift_classify_base(name: str, kind: str | None, is_first: bool,
                           protocols: set[str], classes: set[str]) -> str:
     """Classify a Swift inheritance_specifier entry as `inherits` or `implements`.
@@ -6242,10 +6300,22 @@ def _extract_generic(
     # name -> (type, scope) of its first `type_table` write ("" = file scope).
     swift_type_first_writes: dict[str, tuple[str, str]] = {}
 
-    def _swift_set_type_scope(name: str, type_name: str, scope: str) -> None:
+    # Names a written receiver type cannot be proven to name (typealias,
+    # associatedtype, generic parameter, local type), filled by the pre-scan.
+    swift_shadow_names: frozenset[str] = frozenset()
+
+    def _swift_set_type_scope(name: str, type_name: str | None, scope: str) -> None:
         # Called for every Swift `type_table[name]` write. The table is flat per
         # file, so two writes that disagree make the name's scope unknown; the
         # None sticks even when a later write agrees with the first one.
+        # A written type that is not proven to name the declared type it spells
+        # (`type_name` None: a `Self.X` or generic-parameter annotation the table
+        # skips; or a path through a shadow name) makes the scope unknown at
+        # once, file scope included: the in-file bind and the corpus resolver
+        # then bind nothing for the name.
+        if type_name is None or _swift_type_unproven(type_name, swift_shadow_names):
+            swift_type_scopes[name] = None
+            return
         first = swift_type_first_writes.setdefault(name, (type_name, scope))
         if first != (type_name, scope):
             swift_type_scopes[name] = None
@@ -6254,6 +6324,7 @@ def _extract_generic(
 
     if config.ts_module == "tree_sitter_swift":
         swift_protocol_names, swift_class_names = _swift_pre_scan(root, source)
+        swift_shadow_names = _swift_shadow_names(root, source)
 
     # JS/TS class body -> member collision groups, filled lazily (#4475).
     js_member_groups: dict = {}
@@ -7725,6 +7796,7 @@ def _extract_generic(
                         add_edge(parent_class_nid, target_nid, "references", line, context=ctx)
                     if prop_type is None and role == "type":
                         prop_type = ref_name
+            annotated_unknown = type_anno is not None and prop_type is None
             # #1356 Stage 1: walk the initializer so a constructor call
             # (`let vm = VM()`) produces a calls edge. #1356 Stage 2a: when the
             # property has no type annotation, infer its type from the
@@ -7757,7 +7829,11 @@ def _extract_generic(
             if prop_type is None:
                 prop_type = _swift_attribute_type_name(node, source)
             prop_name = _swift_property_name(node, source)
-            if prop_name and prop_type:
+            if prop_name and annotated_unknown:
+                # `var x: Self.State` / `var x: T`: the annotation names a type
+                # the table cannot record; the name's type is unknown.
+                _swift_set_type_scope(prop_name, None, "")
+            elif prop_name and prop_type:
                 type_table[prop_name] = prop_type
                 _swift_set_type_scope(
                     prop_name, prop_type, swift_scope_stack[-1] if swift_scope_stack else "",
@@ -8293,10 +8369,14 @@ def _extract_generic(
                     # #1356 Stage 2a: record param name -> type (flat per-file
                     # table; later params with the same name win, which is fine
                     # for the depth-1 member-call resolution we do).
-                    if param_type:
+                    # A typed parameter whose type the table cannot record
+                    # (`Self.State`, a generic `T`) is an unknown-type write.
+                    if param_type or type_node is not None:
                         name_node = p.child_by_field_name("name")
                         pname = _read_text(name_node, source) if name_node else None
-                        if pname:
+                        if pname and not param_type:
+                            _swift_set_type_scope(pname, None, "")
+                        elif pname:
                             type_table[pname] = param_type
                             _swift_set_type_scope(
                                 pname, param_type,
@@ -10510,6 +10590,11 @@ def _extract_generic(
             body_scope = swift_body_scopes.get(id(body_node), "")
             for local_name, local_type in body_bindings:
                 _swift_set_type_scope(local_name, local_type, body_scope)
+        # A factory binding (`let x = T.make()`) through a shadow name would be
+        # resolved against an unrelated same-named factory type corpus-side.
+        for factory_name, (factory_type, _method) in swift_factory_bindings.items():
+            if _swift_type_unproven(factory_type, swift_shadow_names):
+                _swift_set_type_scope(factory_name, None, "")
 
     # JS/TS: bodies already walked with their own caller_nid (const-assigned
     # arrows, methods). An INLINE/returned arrow or function-expression that is
@@ -10728,7 +10813,8 @@ def _extract_generic(
     if config.ts_module == "tree_sitter_php":
         _php_receiver_type_table(root, source, type_table)
     if config.ts_module == "tree_sitter_swift":
-        if type_table or swift_factory_bindings:
+        # A scopes-only result (every write rejected) still ships its None.
+        if type_table or swift_factory_bindings or swift_type_scopes:
             result["swift_type_table"] = {
                 "path": str_path, "table": type_table, "scopes": swift_type_scopes,
             }
