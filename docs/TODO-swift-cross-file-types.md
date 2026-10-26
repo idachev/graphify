@@ -67,6 +67,14 @@ top-level declaration (Codex F8); test it with a decorated nested class.
 
 **Why not here.** Pre-existing upstream bug; it goes upstream as its own change.
 
+**Swift, open (ЗД32 r1 F3).** A qualified extension of a nested type declared in another file
+takes `_make_id(stem, "Outer.State")`, the id of a file-level `Outer_State` in the extension's
+file: `Extra.swift` = `extension Outer.State { func extra() {} }` + `struct Outer_State { func top() {} }`
+drops `Outer_State`, hangs `.top()` under the extension node, and `Outer.State` in a third file stays
+an unresolved stub. 0c7165fc gives the same nodes and edges for these files (repro
+`tmp/captain/20261023-145049/reviews/ЗД32-r1-triage.md`, F3); it is an extension-only id
+collision, not a nested type id, so ЗД32 leaves it.
+
 ## ТД4 Raw `.swift` suffix checks ignore the `.graphifyrc` language override
 
 **Evidence.** These checks test the raw file name instead of `effective_suffix`, so a file
