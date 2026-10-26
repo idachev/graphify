@@ -2,8 +2,8 @@
 
 See docs/swift-cross-file-type-resolution-rfc.md. The generic stub rewire keys a label
 by dropping every non-identifier character, so the dotted Swift stub
-``CommandPaletteItem.ID`` shares the key ``CommandPaletteItemID`` with an unrelated
-top-level ``enum CommandPaletteItemID``. A dotted Swift name binds only through
+``MenuItem.ID`` shares the key ``MenuItemID`` with an unrelated
+top-level ``enum MenuItemID``. A dotted Swift name binds only through
 ``_swift_lookup``; when that lookup knows no ``ID`` (status "external") the reference
 stays on its stub.
 
@@ -64,7 +64,7 @@ def _targets(result: dict, source: str, relations=("references",)) -> set[str]:
 
 # ── regression ────────────────────────────────────────────────────────────────
 
-_ITEM_WITHOUT_NESTED_ID = "struct CommandPaletteItem {\n    var name: String\n}\n"
+_ITEM_WITHOUT_NESTED_ID = "struct MenuItem {\n    var name: String\n}\n"
 
 
 @pytest.mark.parametrize(
@@ -75,37 +75,37 @@ _ITEM_WITHOUT_NESTED_ID = "struct CommandPaletteItem {\n    var name: String\n}\
 def test_dotted_member_type_does_not_bind_concatenated_type_name(
     tmp_path: Path, item_source: str | None,
 ):
-    # `var id: CommandPaletteItem.ID` names a nested `ID` nobody declares. The label
-    # key of its stub is `CommandPaletteItemID`, so the generic rewire bound it to the
-    # unrelated top-level `enum CommandPaletteItemID`.
+    # `var id: MenuItem.ID` names a nested `ID` nobody declares. The label
+    # key of its stub is `MenuItemID`, so the generic rewire bound it to the
+    # unrelated top-level `enum MenuItemID`.
     base = tmp_path / "src"
     files = [
-        _write(base / "Palette/Ids.swift", "enum CommandPaletteItemID {\n    case first\n}\n"),
-        _write(base / "Palette/Row.swift", (
+        _write(base / "Menu/Ids.swift", "enum MenuItemID {\n    case first\n}\n"),
+        _write(base / "Menu/Row.swift", (
             "struct Row {\n"
-            "    var id: CommandPaletteItem.ID\n"
+            "    var id: MenuItem.ID\n"
             "}\n"
         )),
     ]
     if item_source is not None:
-        files.append(_write(base / "Palette/CommandPaletteItem.swift", item_source))
+        files.append(_write(base / "Menu/MenuItem.swift", item_source))
     result = _extract(files, tmp_path)
 
-    enum_id = _node(result, "CommandPaletteItemID", "Ids.swift")
+    enum_id = _node(result, "MenuItemID", "Ids.swift")
     foreign = [
         e for e in result["edges"]
         if e.get("target") == enum_id and not _sf(e).endswith("Ids.swift")
     ]
-    assert not foreign, f"no edge from another file may reach CommandPaletteItemID: {foreign}"
+    assert not foreign, f"no edge from another file may reach MenuItemID: {foreign}"
 
     row = _node(result, "Row", "Row.swift")
     targets = _targets(result, row)
     assert enum_id not in targets
     stubs = [
         t for t in targets
-        if _by_id(result)[t].get("label") == "CommandPaletteItem.ID" and _is_stub(result, t)
+        if _by_id(result)[t].get("label") == "MenuItem.ID" and _is_stub(result, t)
     ]
     assert stubs, (
-        "the reference must stay on a sourceless `CommandPaletteItem.ID` stub, got "
+        "the reference must stay on a sourceless `MenuItem.ID` stub, got "
         f"{[_by_id(result)[t].get('label') for t in targets]}"
     )

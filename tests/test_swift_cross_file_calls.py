@@ -524,80 +524,80 @@ def _xext_assert_contained(result: dict, ext_file: str, nid: str) -> None:
 
 
 def test_declaration_with_same_file_extension_absorbs_cross_file_extension(tmp_path: Path):
-    # RC1: `struct PaneLayout` + `extension PaneLayout` in one file share a node id and
-    # the id used to be skipped as a merge candidate, so the `extension PaneLayout` in
+    # RC1: `struct Board` + `extension Board` in one file share a node id and
+    # the id used to be skipped as a merge candidate, so the `extension Board` in
     # another file found no declaration and every referrer kept a per-file stub.
     base = tmp_path / "src"
     files = [
-        _write(base / "App/Models/PaneLayout.swift", (
+        _write(base / "App/Models/Board.swift", (
             "import Foundation\n\n"
-            "struct PaneLayout: Equatable, Codable {\n"
-            "  var panes: [Pane]\n"
-            "  struct Pane: Equatable, Codable { var id: Int }\n"
+            "struct Board: Equatable, Codable {\n"
+            "  var tiles: [Tile]\n"
+            "  struct Tile: Equatable, Codable { var id: Int }\n"
             "  func encodeAll() -> Data { Data() }\n"
             "}\n\n"
-            "extension PaneLayout {\n"
-            "  var isEmpty: Bool { panes.isEmpty }\n"
+            "extension Board {\n"
+            "  var isEmpty: Bool { tiles.isEmpty }\n"
             "}\n"
         )),
-        _write(base / "App/Logic/LayoutsMigrator.swift", (
+        _write(base / "App/Logic/BoardMigrator.swift", (
             "import Foundation\n\n"
-            "extension PaneLayout {\n"
-            "  static func migrated() -> PaneLayout { PaneLayout(panes: []) }\n"
+            "extension Board {\n"
+            "  static func migrated() -> Board { Board(tiles: []) }\n"
             "}\n\n"
-            "enum LayoutsMigrator {\n"
-            "  static func run(_ input: PaneLayout) -> PaneLayout { input }\n"
+            "enum BoardMigrator {\n"
+            "  static func run(_ input: Board) -> Board { input }\n"
             "}\n"
         )),
-        _write(base / "App/Reducer/LayoutFeature.swift", (
+        _write(base / "App/Reducer/BoardFeature.swift", (
             "import Foundation\n\n"
-            "struct LayoutFeature {\n"
+            "struct BoardFeature {\n"
             "  struct State: Equatable {\n"
-            "    var layout: PaneLayout\n"
-            "    var focused: PaneLayout.Pane?\n"
+            "    var layout: Board\n"
+            "    var focused: Board.Tile?\n"
             "  }\n"
             "  func reset(_ state: inout State) {\n"
-            "    state.layout = PaneLayout(panes: [])\n"
+            "    state.layout = Board(tiles: [])\n"
             "  }\n"
             "}\n"
         )),
-        _write(base / "App/Logic/Persistence.swift", (
+        _write(base / "App/Logic/Store.swift", (
             "import Foundation\n\n"
-            "final class LayoutPersistence {\n"
-            "  var cached: PaneLayout?\n"
-            "  func save(_ layout: PaneLayout) {}\n"
-            "  func load() -> PaneLayout { PaneLayout(panes: []) }\n"
+            "final class BoardStore {\n"
+            "  var cached: Board?\n"
+            "  func save(_ layout: Board) {}\n"
+            "  func load() -> Board { Board(tiles: []) }\n"
             "}\n"
         )),
     ]
     result = extract(files, cache_root=tmp_path / "cache", root=base, parallel=False)
 
-    # One PaneLayout node: the declaration. No extension node, no per-file stub.
-    layouts = _xext_nodes(result, "PaneLayout")
-    assert len(layouts) == 1, f"expected one PaneLayout node, got {[(n['id'], n.get('source_file')) for n in layouts]}"
+    # One Board node: the declaration. No extension node, no per-file stub.
+    layouts = _xext_nodes(result, "Board")
+    assert len(layouts) == 1, f"expected one Board node, got {[(n['id'], n.get('source_file')) for n in layouts]}"
     decl = layouts[0]
-    assert str(decl.get("source_file", "")).endswith("PaneLayout.swift")
+    assert str(decl.get("source_file", "")).endswith("Board.swift")
     assert not decl.get("_swift_extension_only"), "a declared type must not be marked extension-only"
     nid = decl["id"]
 
     # The cross-file extension's method hangs on the declaration, and the extension's
     # file contains it.
-    migrated = _xext_one(result, ".migrated()", "LayoutsMigrator.swift")
+    migrated = _xext_one(result, ".migrated()", "BoardMigrator.swift")
     assert _xext_has_edge(result, nid, migrated["id"], "method")
-    for file_label in ("PaneLayout.swift", "LayoutsMigrator.swift"):
+    for file_label in ("Board.swift", "BoardMigrator.swift"):
         file_node = _xext_one(result, file_label, file_label)
         assert _xext_has_edge(result, file_node["id"], nid, "contains"), f"{file_label} must contain the declaration"
 
     # Every `references` edge from the other files lands on that node.
     refs = _xext_incoming(result, nid)
     expected = {
-        (".run()", "parameter_type", "LayoutsMigrator.swift"),
-        (".run()", "return_type", "LayoutsMigrator.swift"),
-        (".migrated()", "return_type", "LayoutsMigrator.swift"),
-        ("State", "field", "LayoutFeature.swift"),
-        ("LayoutPersistence", "field", "Persistence.swift"),
-        (".save()", "parameter_type", "Persistence.swift"),
-        (".load()", "return_type", "Persistence.swift"),
+        (".run()", "parameter_type", "BoardMigrator.swift"),
+        (".run()", "return_type", "BoardMigrator.swift"),
+        (".migrated()", "return_type", "BoardMigrator.swift"),
+        ("State", "field", "BoardFeature.swift"),
+        ("BoardStore", "field", "Store.swift"),
+        (".save()", "parameter_type", "Store.swift"),
+        (".load()", "return_type", "Store.swift"),
     }
     assert expected <= refs, f"references that missed the declaration: {sorted(expected - refs)}"
 
@@ -889,22 +889,22 @@ def _constructor_calls(result: dict, caller_label: str) -> list[dict]:
 
 
 def test_cross_file_constructor_call_emits_inferred_call(tmp_path: Path):
-    # `.reset()` names PaneLayout only in the constructor call, not as a type,
+    # `.reset()` names Board only in the constructor call, not as a type,
     # so the (caller, target) pair dedup cannot hide the edge behind a
-    # `references` edge. The caller's file names PaneLayout as a field type
+    # `references` edge. The caller's file names Board as a field type
     # without defining it, which made the call a `via_stub` call that the
     # import-evidence gate dropped before.
     base = tmp_path / "src"
     files = [
-        _write(base / "Models/PaneLayout.swift",
-               "struct PaneLayout {\n    let panes: [Int]\n}\n"),
-        _write(base / "Reducer/LayoutFeature.swift", (
-            "struct LayoutFeature {\n"
+        _write(base / "Models/Board.swift",
+               "struct Board {\n    let tiles: [Int]\n}\n"),
+        _write(base / "Reducer/BoardFeature.swift", (
+            "struct BoardFeature {\n"
             "    struct State {\n"
-            "        var layout: PaneLayout\n"
+            "        var layout: Board\n"
             "    }\n"
             "    func reset(_ state: inout State) {\n"
-            "        state.layout = PaneLayout(panes: [])\n"
+            "        state.layout = Board(tiles: [])\n"
             "    }\n"
             "}\n"
         )),
@@ -913,8 +913,8 @@ def test_cross_file_constructor_call_emits_inferred_call(tmp_path: Path):
 
     decl_ids = {
         n["id"] for n in result["nodes"]
-        if n.get("label") == "PaneLayout"
-        and str(n.get("source_file", "")).endswith("Models/PaneLayout.swift")
+        if n.get("label") == "Board"
+        and str(n.get("source_file", "")).endswith("Models/Board.swift")
     }
     assert len(decl_ids) == 1
     calls = [e for e in _constructor_calls(result, ".reset()") if e["target"] in decl_ids]

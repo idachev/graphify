@@ -4093,10 +4093,10 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
         )
 
     def _swift_dotted_stub_edge(edge: dict, stub_id: str) -> bool:
-        """A Swift edge on a dotted stub (`CommandPaletteItem.ID`) keeps its stub.
+        """A Swift edge on a dotted stub (`MenuItem.ID`) keeps its stub.
 
         The label key drops the dot, so the stub would bind an unrelated
-        `CommandPaletteItemID`. A dotted Swift name binds only through
+        `MenuItemID`. A dotted Swift name binds only through
         `_swift_lookup` (the Swift type-reference pass); what that pass left on
         the stub stays there. Method-shaped `.foo()` stubs and edges from other
         languages keep the label-key match.
@@ -4925,8 +4925,8 @@ def _resolve_swift_member_calls(
             continue
         elif is_swift_call and "." in type_name:
             # A dotted Swift name resolves only through `_swift_lookup`: the
-            # `_key` strip would turn `CommandPaletteItem.ID` into the unrelated
-            # `CommandPaletteItemID`. Unbound, it parks like any unknown type.
+            # `_key` strip would turn `MenuItem.ID` into the unrelated
+            # `MenuItemID`. Unbound, it parks like any unknown type.
             type_defs = []
         else:
             type_defs = type_def_nids.get(_key(type_name), [])

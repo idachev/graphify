@@ -81,50 +81,50 @@ def test_language_override_file_types_are_indexed(tmp_path: Path):
     # A type declared in a remapped file is in the Swift type index.
     base = tmp_path / "src"
     _write(base / ".graphifyrc", _OVERRIDE)
-    types = _write(base / "Types.swifttpl", "enum Palette { struct Item {} }\n")
-    use = _write(base / "Use.swift", "struct Holder { let x: Palette.Item }\n")
+    types = _write(base / "Types.swifttpl", "enum Menu { struct Item {} }\n")
+    use = _write(base / "Use.swift", "struct Holder { let x: Menu.Item }\n")
     result = _run([types, use], tmp_path)
 
     refs = _targets(result, _single(_nodes_by_file(result, use, "Holder")), "references")
     assert _single(_nodes_by_file(result, types, "Item")) in refs
-    assert not refs & _stub_ids(result, "Palette.Item")
+    assert not refs & _stub_ids(result, "Menu.Item")
 
 
 def test_type_reference_from_language_override_file_binds(tmp_path: Path):
     # A reference written in a remapped file goes through the Swift lookup.
     base = tmp_path / "src"
     _write(base / ".graphifyrc", _OVERRIDE)
-    types = _write(base / "Types.swift", "enum Palette { struct Item {} }\n")
-    use = _write(base / "Use.swifttpl", "struct Holder { let x: Palette.Item }\n")
+    types = _write(base / "Types.swift", "enum Menu { struct Item {} }\n")
+    use = _write(base / "Use.swifttpl", "struct Holder { let x: Menu.Item }\n")
     result = _run([types, use], tmp_path)
 
     refs = _targets(result, _single(_nodes_by_file(result, use, "Holder")), "references")
     assert _single(_nodes_by_file(result, types, "Item")) in refs
-    assert not refs & _stub_ids(result, "Palette.Item")
+    assert not refs & _stub_ids(result, "Menu.Item")
 
 
 def test_dotted_stub_in_language_override_file_keeps_stub(tmp_path: Path):
-    # `CommandPaletteItem.ID` from a remapped file keeps its stub instead of
-    # binding the unrelated `CommandPaletteItemID` by the dot-free label key.
+    # `MenuItem.ID` from a remapped file keeps its stub instead of
+    # binding the unrelated `MenuItemID` by the dot-free label key.
     base = tmp_path / "src"
     _write(base / ".graphifyrc", _OVERRIDE)
-    defs = _write(base / "Defs.swift", "struct CommandPaletteItemID {}\n")
-    use = _write(base / "Use.swifttpl", "struct Holder { let x: CommandPaletteItem.ID }\n")
+    defs = _write(base / "Defs.swift", "struct MenuItemID {}\n")
+    use = _write(base / "Use.swifttpl", "struct Holder { let x: MenuItem.ID }\n")
     result = _run([defs, use], tmp_path)
 
     refs = _targets(result, _single(_nodes_by_file(result, use, "Holder")), "references")
-    assert refs & _stub_ids(result, "CommandPaletteItem.ID")
-    assert not refs & set(_nodes_by_file(result, defs, "CommandPaletteItemID"))
+    assert refs & _stub_ids(result, "MenuItem.ID")
+    assert not refs & set(_nodes_by_file(result, defs, "MenuItemID"))
 
 
 def test_uppercase_swift_suffix_corpus_binds_type_reference(tmp_path: Path):
     # A corpus of `.SWIFT` files only, no override: the type-reference pass
     # still runs and the declaring file is still indexed.
     base = tmp_path / "src"
-    types = _write(base / "Types.SWIFT", "enum Palette { struct Item {} }\n")
-    use = _write(base / "Use.SWIFT", "struct Holder { let x: Palette.Item }\n")
+    types = _write(base / "Types.SWIFT", "enum Menu { struct Item {} }\n")
+    use = _write(base / "Use.SWIFT", "struct Holder { let x: Menu.Item }\n")
     result = _run([types, use], tmp_path)
 
     refs = _targets(result, _single(_nodes_by_file(result, use, "Holder")), "references")
     assert _single(_nodes_by_file(result, types, "Item")) in refs
-    assert not refs & _stub_ids(result, "Palette.Item")
+    assert not refs & _stub_ids(result, "Menu.Item")
