@@ -9,8 +9,6 @@ for an unchanged file of a changed-files rebuild through the scan root, never
 the working directory. A Python shebang script still binds.
 """
 
-import pytest
-
 from graphify.extract import extract
 
 INNER_PY = "class Inner:\n    @staticmethod\n    def go():\n        return 1\n"
@@ -122,9 +120,7 @@ def test_rebuild_unchanged_python_script_target_still_binds(tmp_path, monkeypatc
     assert (".go()", "tool") in _edges_from(calls, "run()")
 
 
-@pytest.mark.xfail(strict=True, reason="ТД5 F4: the Python pass wakes on a .py path only "
-                   "(extract.py python_member_calls registration, resolver_registry.py "
-                   "suffixes_present); a rebuild of only an extensionless script skips it")
 def test_rebuild_of_only_a_python_script_binds(tmp_path):
+    # No `.py` among the changed paths: the pass must still wake for the script.
     calls = _rebuild(tmp_path, {"inner.py": INNER_PY, "tool": PYTHON_CALLER}, "tool")
     assert (".go()", "inner.py") in _edges_from(calls, "tool_main()")

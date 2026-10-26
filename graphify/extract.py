@@ -7795,8 +7795,10 @@ register_language_resolver(
 register_language_resolver(
     LanguageResolver("swift_member_calls", frozenset({".swift"}), _resolve_swift_member_calls)
 )
+# `""` wakes the Python pass for a changed extensionless script too; its language
+# gate (_stamp_script_languages) keeps non-Python shebang scripts out.
 register_language_resolver(
-    LanguageResolver("python_member_calls", frozenset({".py"}), _resolve_python_member_calls)
+    LanguageResolver("python_member_calls", frozenset({".py", ""}), _resolve_python_member_calls)
 )
 # Ruby type-aware member-call resolution (Class.new + typed var.method). Lives in
 # graphify.ruby_resolution; registered here as a second consumer of the framework.
