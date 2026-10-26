@@ -256,6 +256,7 @@ def _c_header_type_corpus() -> tuple[list[dict], list[dict], list[dict]]:
 
 def _resolved_into_inner(monkeypatch=None, gate=None) -> list[dict]:
     if gate is not None:
+        assert monkeypatch is not None
         monkeypatch.setattr(extract_module, "_swift_header_target_ok", gate)
     per_file, nodes, edges = _c_header_type_corpus()
     extract_module._resolve_swift_member_calls(per_file, nodes, edges)
