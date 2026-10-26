@@ -20,12 +20,12 @@ def _node(nid: str, qualified: list[str], source_file: str = "App/Model.swift", 
 
 def test_index_keys_by_path_and_last_segment():
     index = _swift_type_index([
-        _node("pane_layout", ["PaneLayout"]),
-        _node("pane", ["PaneLayout.Pane"]),
+        _node("board", ["Board"]),
+        _node("tile", ["Board.Tile"]),
     ])
     assert isinstance(index, SwiftTypeIndex)
-    assert index.by_path == {"PaneLayout": ["pane_layout"], "PaneLayout.Pane": ["pane"]}
-    assert index.by_label == {"PaneLayout": ["pane_layout"], "Pane": ["pane"]}
+    assert index.by_path == {"Board": ["board"], "Board.Tile": ["tile"]}
+    assert index.by_label == {"Board": ["board"], "Tile": ["tile"]}
 
 
 def test_extension_only_nodes_are_excluded():
@@ -64,12 +64,12 @@ def test_lexical_lookup_is_innermost_first():
 
 def test_dotted_name_resolves_through_scope_levels():
     index = _swift_type_index([
-        _node("pane_layout", ["PaneLayout"]),
-        _node("pane", ["PaneLayout.Pane"]),
+        _node("board", ["Board"]),
+        _node("tile", ["Board.Tile"]),
     ])
-    assert _swift_lookup(index, "PaneLayout.Pane", "") == ("resolved", "pane")
-    assert _swift_lookup(index, "PaneLayout.Pane", "Screen") == ("resolved", "pane")
-    assert _swift_lookup(index, "Pane", "PaneLayout") == ("resolved", "pane")
+    assert _swift_lookup(index, "Board.Tile", "") == ("resolved", "tile")
+    assert _swift_lookup(index, "Board.Tile", "Screen") == ("resolved", "tile")
+    assert _swift_lookup(index, "Tile", "Board") == ("resolved", "tile")
 
 
 def test_two_candidates_at_a_level_stop_the_search():
@@ -95,15 +95,15 @@ def test_nested_type_is_unresolved_outside_its_scope():
 
 
 def test_unknown_last_segment_is_external():
-    index = _swift_type_index([_node("pane", ["PaneLayout.Pane"])])
-    assert _swift_lookup(index, "View", "PaneLayout") == ("external", None)
+    index = _swift_type_index([_node("tile", ["Board.Tile"])])
+    assert _swift_lookup(index, "View", "Board") == ("external", None)
     assert _swift_lookup(index, "SwiftUI.View", "") == ("external", None)
     assert _swift_lookup(index, "", "") == ("external", None)
 
 
 def test_dotted_name_with_known_last_segment_but_wrong_path_is_unresolved():
-    index = _swift_type_index([_node("pane", ["PaneLayout.Pane"])])
-    assert _swift_lookup(index, "Other.Pane", "PaneLayout") == ("unresolved", None)
+    index = _swift_type_index([_node("tile", ["Board.Tile"])])
+    assert _swift_lookup(index, "Other.Tile", "Board") == ("unresolved", None)
 
 
 def test_node_with_two_paths_is_ambiguous_whenever_hit():
@@ -128,10 +128,10 @@ def test_two_paths_with_different_last_segments_are_ambiguous():
 
 
 def test_same_node_listed_twice_is_one_candidate():
-    node = _node("pane", ["PaneLayout.Pane"])
+    node = _node("tile", ["Board.Tile"])
     index = _swift_type_index([node, dict(node)])
-    assert index.by_path == {"PaneLayout.Pane": ["pane"]}
-    assert _swift_lookup(index, "Pane", "PaneLayout") == ("resolved", "pane")
+    assert index.by_path == {"Board.Tile": ["tile"]}
+    assert _swift_lookup(index, "Tile", "Board") == ("resolved", "tile")
 
 
 def test_order_is_deterministic_regardless_of_input_order():

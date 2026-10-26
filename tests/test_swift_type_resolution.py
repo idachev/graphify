@@ -106,21 +106,21 @@ def _method_of(result: dict, owner: str, label: str) -> str:
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
 
-def _pane_layout_files(base: Path) -> list[Path]:
+def _board_files(base: Path) -> list[Path]:
     return [
-        _write(base / "App/Models/PaneLayout.swift", (
+        _write(base / "App/Models/Board.swift", (
             "import Foundation\n\n"
-            "struct PaneLayout: Equatable {\n"
-            "    var panes: [Pane]\n"
-            "    struct Pane: Equatable { var id: Int }\n"
+            "struct Board: Equatable {\n"
+            "    var tiles: [Tile]\n"
+            "    struct Tile: Equatable { var id: Int }\n"
             "}\n"
         )),
-        _write(base / "App/Reducer/LayoutFeature.swift", (
+        _write(base / "App/Reducer/BoardFeature.swift", (
             "import Foundation\n\n"
-            "struct LayoutFeature {\n"
+            "struct BoardFeature {\n"
             "    struct State {\n"
-            "        var layout: PaneLayout\n"
-            "        var focused: PaneLayout.Pane?\n"
+            "        var layout: Board\n"
+            "        var focused: Board.Tile?\n"
             "    }\n"
             "}\n"
         )),
@@ -130,8 +130,8 @@ def _pane_layout_files(base: Path) -> list[Path]:
 def _two_reducers(base: Path) -> list[Path]:
     """Two features that both declare a nested ``State``."""
     return [
-        _write(base / "Features/LayoutFeature.swift",
-               "struct LayoutFeature {\n    struct State { var n: Int }\n}\n"),
+        _write(base / "Features/BoardFeature.swift",
+               "struct BoardFeature {\n    struct State { var n: Int }\n}\n"),
         _write(base / "Features/OtherFeature.swift",
                "struct OtherFeature {\n    struct State { var m: Int }\n}\n"),
     ]
@@ -140,37 +140,37 @@ def _two_reducers(base: Path) -> list[Path]:
 # ── regressions ───────────────────────────────────────────────────────────────
 
 def test_qualified_nested_reference_resolves_to_nested_type(tmp_path: Path):
-    # `var focused: PaneLayout.Pane?` was reduced to its head and bound to PaneLayout.
-    files = _pane_layout_files(tmp_path / "src")
+    # `var focused: Board.Tile?` was reduced to its head and bound to Board.
+    files = _board_files(tmp_path / "src")
     result = _extract(files, tmp_path)
 
-    pane = _node(result, "Pane", "PaneLayout.swift", parent="PaneLayout")
-    _assert_declaration(result, pane, "Pane", "PaneLayout.swift", "PaneLayout")
-    state = _node(result, "State", "LayoutFeature.swift", parent="LayoutFeature")
-    layout = _node(result, "PaneLayout", "PaneLayout.swift")
+    tile = _node(result, "Tile", "Board.swift", parent="Board")
+    _assert_declaration(result, tile, "Tile", "Board.swift", "Board")
+    state = _node(result, "State", "BoardFeature.swift", parent="BoardFeature")
+    layout = _node(result, "Board", "Board.swift")
 
     targets = _targets(result, state)
-    assert pane in targets, "State.focused must reach the nested Pane declaration"
-    assert layout in targets, "State.layout still reaches PaneLayout"
-    assert not [t for t in targets if _by_id(result)[t].get("label") == "PaneLayout.Pane"], (
+    assert tile in targets, "State.focused must reach the nested Tile declaration"
+    assert layout in targets, "State.layout still reaches Board"
+    assert not [t for t in targets if _by_id(result)[t].get("label") == "Board.Tile"], (
         "the repointed qualified reference must not leave its stub behind"
     )
 
 
 def test_bare_nested_name_resolves_lexically_in_extension(tmp_path: Path):
-    # Inside `extension LayoutFeature`, a bare `State` means LayoutFeature.State and
+    # Inside `extension BoardFeature`, a bare `State` means BoardFeature.State and
     # not the State of another reducer.
     base = tmp_path / "src"
     files = _two_reducers(base) + [
-        _write(base / "Features/LayoutFeature+Ext.swift",
-               "extension LayoutFeature {\n    func f(_ s: State) {}\n}\n"),
+        _write(base / "Features/BoardFeature+Ext.swift",
+               "extension BoardFeature {\n    func f(_ s: State) {}\n}\n"),
     ]
     result = _extract(files, tmp_path)
 
-    own = _node(result, "State", "LayoutFeature.swift", parent="LayoutFeature")
+    own = _node(result, "State", "BoardFeature.swift", parent="BoardFeature")
     other = _node(result, "State", "OtherFeature.swift", parent="OtherFeature")
-    _assert_declaration(result, own, "State", "LayoutFeature.swift", "LayoutFeature")
-    f = _node(result, ".f()", "LayoutFeature+Ext.swift")
+    _assert_declaration(result, own, "State", "BoardFeature.swift", "BoardFeature")
+    f = _node(result, ".f()", "BoardFeature+Ext.swift")
 
     targets = _targets(result, f)
     assert own in targets
@@ -195,15 +195,15 @@ def test_bare_name_not_visible_lexically_stays_on_stub(tmp_path: Path):
 
 
 def test_extension_of_nested_type_merges(tmp_path: Path):
-    # `extension LayoutFeature.State` merges into the nested declaration.
+    # `extension BoardFeature.State` merges into the nested declaration.
     base = tmp_path / "src"
     files = _two_reducers(base) + [
         _write(base / "Features/State+Ext.swift",
-               "extension LayoutFeature.State {\n    func reset() {}\n}\n"),
+               "extension BoardFeature.State {\n    func reset() {}\n}\n"),
     ]
     result = _extract(files, tmp_path)
 
-    own = _node(result, "State", "LayoutFeature.swift", parent="LayoutFeature")
+    own = _node(result, "State", "BoardFeature.swift", parent="BoardFeature")
     other = _node(result, "State", "OtherFeature.swift", parent="OtherFeature")
     reset = _node(result, ".reset()", "State+Ext.swift")
 
@@ -211,11 +211,11 @@ def test_extension_of_nested_type_merges(tmp_path: Path):
         e["source"] for e in result["edges"]
         if e.get("relation") == "method" and e.get("target") == reset
     }
-    assert methods == {own}, f"reset() must attach to LayoutFeature.State only, got {methods}"
+    assert methods == {own}, f"reset() must attach to BoardFeature.State only, got {methods}"
     assert other not in methods
     leftovers = [
         n["id"] for n in result["nodes"]
-        if n.get("label") in ("State", "LayoutFeature.State") and _sf(n).endswith("State+Ext.swift")
+        if n.get("label") in ("State", "BoardFeature.State") and _sf(n).endswith("State+Ext.swift")
     ]
     assert not leftovers, f"the extension must not survive as its own node: {leftovers}"
 
@@ -225,14 +225,14 @@ def test_qualified_conformance_and_generic_args_resolve(tmp_path: Path):
     # reach the nested declarations, with the relation the base kind dictates:
     # a struct conforms (`implements`), the first base of a class is `inherits`.
     base = tmp_path / "src"
-    files = _pane_layout_files(base) + [
+    files = _board_files(base) + [
         _write(base / "Outer.swift", (
             "enum Outer {\n    protocol Proto {}\n    class Base { func hello() {} }\n}\n"
         )),
         _write(base / "Conf.swift", "struct Conf: Outer.Proto {}\n"),
         _write(base / "Child.swift", "class Child: Outer.Base {}\n"),
         _write(base / "Holder.swift",
-               "struct Holder {\n    var x: [String: PaneLayout.Pane]\n}\n"),
+               "struct Holder {\n    var x: [String: Board.Tile]\n}\n"),
     ]
     result = _extract(files, tmp_path)
 
@@ -240,21 +240,21 @@ def test_qualified_conformance_and_generic_args_resolve(tmp_path: Path):
     _assert_declaration(result, proto, "Proto", "Outer.swift", "Outer")
     outer_base = _node(result, "Base", "Outer.swift", parent="Outer")
     _assert_declaration(result, outer_base, "Base", "Outer.swift", "Outer")
-    pane = _node(result, "Pane", "PaneLayout.swift", parent="PaneLayout")
+    tile = _node(result, "Tile", "Board.swift", parent="Board")
 
     assert proto in _targets(result, _node(result, "Conf", "Conf.swift"), ("implements",))
     assert outer_base in _targets(result, _node(result, "Child", "Child.swift"), ("inherits",))
-    assert pane in _targets(result, _node(result, "Holder", "Holder.swift"))
+    assert tile in _targets(result, _node(result, "Holder", "Holder.swift"))
 
 
 def test_type_table_records_full_path(tmp_path: Path):
     # The per-file extractor result keeps the written dotted path and the scope of the
     # property, so the corpus pass can resolve `focused.xxx()` against the right type.
-    path = _write(tmp_path / "src/LayoutFeature.swift", (
-        "struct LayoutFeature {\n"
-        "    var plain: PaneLayout\n"
+    path = _write(tmp_path / "src/BoardFeature.swift", (
+        "struct BoardFeature {\n"
+        "    var plain: Board\n"
         "    struct State {\n"
-        "        var focused: PaneLayout.Pane?\n"
+        "        var focused: Board.Tile?\n"
         "    }\n"
         "}\n"
     ))
@@ -262,10 +262,10 @@ def test_type_table_records_full_path(tmp_path: Path):
 
     table = result["swift_type_table"]["table"]
     scopes = result["swift_type_table"]["scopes"]
-    assert table["focused"] == "PaneLayout.Pane"
-    assert scopes["focused"] == "LayoutFeature.State"
-    assert table["plain"] == "PaneLayout"
-    assert scopes["plain"] == "LayoutFeature"
+    assert table["focused"] == "Board.Tile"
+    assert scopes["focused"] == "BoardFeature.State"
+    assert table["plain"] == "Board"
+    assert scopes["plain"] == "BoardFeature"
 
 
 def test_member_call_through_nested_type_annotation(tmp_path: Path):
@@ -596,7 +596,7 @@ def test_swift_reference_to_non_swift_type_keeps_generic_rewire(tmp_path: Path):
                    for t in targets), "no stub is left for the resolved reference"
 
 
-@pytest.mark.parametrize("name", ["PaneLayout.Pane", "Outer.Inner"])
+@pytest.mark.parametrize("name", ["Board.Tile", "Outer.Inner"])
 def test_dotted_external_name_keeps_its_full_label_on_stub(tmp_path: Path, name: str):
     # Nothing in the corpus declares the type: the stub keeps the written dotted label
     # (RFC open question 4), so a later declaration can still be told apart.

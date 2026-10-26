@@ -6413,7 +6413,7 @@ def _extract_generic(
     swift_protocol_names: set[str] = set()
     swift_class_names: set[str] = set()
     # Qualified path of each enclosing Swift type (or extended type) during the
-    # walk, innermost last (`["LayoutFeature", "LayoutFeature.State"]`). A stack,
+    # walk, innermost last (`["BoardFeature", "BoardFeature.State"]`). A stack,
     # not a nid -> path map: two same-named nested types can share one id, and
     # their members must still see the path of the declaration they sit in.
     swift_scope_stack: list[str] = []

@@ -141,20 +141,20 @@ def test_member_call_with_real_declaration_still_binds(tmp_path: Path):
 
 
 def test_dotted_external_type_name_does_not_bind_through_label_key(tmp_path: Path):
-    # `CommandPaletteItem.ID` is declared nowhere here. The label key strips the dot,
-    # so without the guard `x.run()` bound to the unrelated `CommandPaletteItemID.run`.
+    # `MenuItem.ID` is declared nowhere here. The label key strips the dot,
+    # so without the guard `x.run()` bound to the unrelated `MenuItemID.run`.
     base = tmp_path / "src"
     files = [
-        _write(base / "App" / "ItemID.swift", "enum CommandPaletteItemID {\n    func run() {}\n}\n"),
+        _write(base / "App" / "ItemID.swift", "enum MenuItemID {\n    func run() {}\n}\n"),
         _write(
             base / "App" / "Use.swift",
-            "class User {\n    let x: CommandPaletteItem.ID\n    func go() {\n        x.run()\n    }\n}\n",
+            "class User {\n    let x: MenuItem.ID\n    func go() {\n        x.run()\n    }\n}\n",
         ),
     ]
     result = _extract(files, tmp_path)
 
     by_id = _by_id(result)
-    item_ids = {n["id"] for n in result["nodes"] if n.get("label") == "CommandPaletteItemID"}
+    item_ids = {n["id"] for n in result["nodes"] if n.get("label") == "MenuItemID"}
     assert item_ids, "setup: the namesake enum must exist"
     run_ids = {
         e["target"] for e in result["edges"]
