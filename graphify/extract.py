@@ -5051,6 +5051,57 @@ def _stamp_python_fixture_paths(per_file: "list[dict | None]", root: Path) -> No
             result["_python_fixture_files"] = located
 
 
+def _script_is_python(path: Path) -> "bool | None":
+    """The language of an extensionless script, by its shebang, as extraction
+    decides it; None (unknown) when there is no readable shebang or its
+    interpreter maps to no extractor."""
+    from graphify.detect import _shebang_interpreter
+    interp = _shebang_interpreter(path)
+    extractor = _SHEBANG_DISPATCH.get(interp) if interp is not None else None
+    if extractor is None:
+        return None
+    return extractor is extract_python
+
+
+def _stamp_script_languages(
+    per_file: "list[dict | None]",
+    paths: "list[Path]",
+    context_nodes: "list[dict] | None",
+    root: Path,
+) -> None:
+    """Python or not, per extensionless source_file, for the language gate of
+    _resolve_python_member_calls. Re-extracted files are read through the path
+    extract() was given; an unchanged file's context node through the scan root,
+    never the working directory. Unknown files get no entry. The map rides on the
+    first result, in memory only (results were cached before resolution), and no
+    context node is touched."""
+    languages: dict[str, bool] = {}
+    first: "dict | None" = None
+    for result, path in zip(per_file, paths):
+        if not result:
+            continue
+        first = first or result
+        if effective_suffix(path):
+            continue
+        is_python = _script_is_python(path)
+        if is_python is None:
+            continue
+        files = {str(path)}
+        files.update(str(n["source_file"]) for n in result.get("nodes", []) if n.get("source_file"))
+        files.update(str(rc["source_file"]) for rc in result.get("raw_calls", []) if rc.get("source_file"))
+        languages.update(dict.fromkeys(files, is_python))
+    context_files = {str(n["source_file"]) for n in context_nodes or [] if n.get("source_file")}
+    for source_file in context_files - languages.keys():
+        if effective_suffix(source_file):
+            continue
+        location = Path(source_file)
+        is_python = _script_is_python(location if location.is_absolute() else root / location)
+        if is_python is not None:
+            languages[source_file] = is_python
+    if first is not None and languages:
+        first["_script_python"] = languages
+
+
 def _resolve_python_member_calls(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -5074,12 +5125,19 @@ def _resolve_python_member_calls(
     def _key(label: str) -> str:
         return re.sub(r"[^a-zA-Z0-9]+", "", str(label)).lower()
 
+    # Extensionless scripts whose shebang was read (_stamp_script_languages).
+    script_python: dict[str, bool] = {}
+    for result in per_file:
+        script_python.update(result.get("_script_python") or {})
+
     def _is_python_file(source_file: object) -> bool:
         # The effective suffix honours a `.graphifyrc` language override. An
-        # extensionless file (a shebang script) or a raw call that names no file
-        # is unknown and passes, as before the gate.
+        # extensionless file is Python when its shebang says so; one with no
+        # readable shebang, or a raw call that names no file, is unknown and passes.
         suffix = effective_suffix(str(source_file or "")).lower()
-        return not suffix or suffix in (".py", ".pyi")
+        if not suffix:
+            return script_python.get(str(source_file or ""), True)
+        return suffix in (".py", ".pyi")
 
     node_by_id: dict[str, dict] = {n.get("id"): n for n in all_nodes}
 
@@ -7767,8 +7825,10 @@ register_language_resolver(
 register_language_resolver(
     LanguageResolver("swift_member_calls", frozenset({".swift"}), _resolve_swift_member_calls)
 )
+# `""` wakes the Python pass for a changed extensionless script too; its language
+# gate (_stamp_script_languages) keeps non-Python shebang scripts out.
 register_language_resolver(
-    LanguageResolver("python_member_calls", frozenset({".py"}), _resolve_python_member_calls)
+    LanguageResolver("python_member_calls", frozenset({".py", ""}), _resolve_python_member_calls)
 )
 # Ruby type-aware member-call resolution (Class.new + typed var.method). Lives in
 # graphify.ruby_resolution; registered here as a second consumer of the framework.
@@ -11264,6 +11324,7 @@ def extract(
     # unchanged file is ever emitted, and the ambiguity guards count the same
     # candidates a full build would (the context is the whole unchanged corpus).
     _stamp_python_fixture_paths(per_file, root)
+    _stamp_script_languages(per_file, paths, resolution_context_nodes, root)
     if resolution_context_nodes or resolution_context_edges:
         _rl_nodes = list(resolution_nodes)
         _rl_edges = all_edges + list(resolution_context_edges or [])

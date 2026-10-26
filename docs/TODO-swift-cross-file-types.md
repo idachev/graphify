@@ -58,16 +58,6 @@ as a top-level type named `Outer_State` in the same file (`_swift_member_nid`,
 **Why not here.** The input is artificial and the fix is a change of the id scheme shared with
 Python, outside the task's scope.
 
-## ТД5 Extensionless scripts still reach the Python member-call pass
-
-**Evidence.** `_is_python_file` in `_resolve_python_member_calls`
-(`graphify/extract.py:5186-5191`) lets a file with no suffix pass, so an extensionless bash or
-node script can still be a caller or target of the Python member-call pass, as before the gate.
-
-**Why not here.** Accepted risk of review ЗД26 r1 F2: the earlier shebang check read files
-relative to the working directory and could drop a real Python edge on a rebuild run outside the
-scan root; a safe check needs the scan root or the detected language passed into the pass.
-
 ## ТД8 The in-file Swift receiver bind matches by label only
 
 **Evidence.** Pre-existing. With a single write for a receiver (`var x: State`), the Swift
