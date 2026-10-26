@@ -1738,8 +1738,8 @@ def _swift_unproven_bindings(root_node, source: bytes,
     Negative facts only, for the binding sites the receiver table does not read:
     every name of a (protocol) property declaration at any level (file scope,
     type member, local; `var a, b: T` and `var a: T, b: U` included) whose
-    annotation records no proven type, or which has no annotation and an
-    initializer through an unproven type, and every typed closure parameter
+    annotation records no proven type, or whose declaration has an initializer
+    through an unproven type (annotated or not), and every typed closure parameter
     whose type is unproven. Untyped bindings are not listed.
     """
     names: list[str] = []
@@ -1748,6 +1748,7 @@ def _swift_unproven_bindings(root_node, source: bytes,
         n = stack.pop()
         if n.type in ("property_declaration", "protocol_property_declaration"):
             pending: list[str] = []
+            declared: list[str] = []
             for c in n.children:
                 if c.type == "pattern":
                     name_node = next(
@@ -1755,13 +1756,15 @@ def _swift_unproven_bindings(root_node, source: bytes,
                     )
                     if name_node is not None and _read_text(name_node, source):
                         pending.append(_read_text(name_node, source))
+                        declared.append(pending[-1])
                 elif c.type == "type_annotation":
                     if _swift_annotation_unproven(c, source, shadow_names):
                         names.extend(pending)
                     pending = []
-                elif pending and _swift_initializer_unproven(c, source, shadow_names):
-                    names.extend(pending)
-                    pending = []
+                elif declared and _swift_initializer_unproven(c, source, shadow_names):
+                    # Checked even under an annotation (`let x: any P =
+                    # Box.make()`): every name of the declaration is unknown.
+                    names.extend(declared)
         elif n.type == "lambda_parameter":
             idents = [c for c in n.children if c.type == "simple_identifier"]
             type_node = next(

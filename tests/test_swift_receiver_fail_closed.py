@@ -210,6 +210,18 @@ CASES = {
         "    }\n"
         "}\n",
         False, [".a()"]),
+    # Review r2 F1: an annotation does not hide an unproven factory initializer.
+    "R2_F1_annotated_generic_factory": (
+        "protocol P { func go() }\n"
+        "protocol Q { static func make() -> any P }\n"
+        "struct State: P { func go() {} }\n"
+        "struct A<Box: Q> {\n"
+        "    func a() {\n"
+        "        let x: any P = Box.make()\n"
+        "        x.go()\n"
+        "    }\n"
+        "}\n",
+        False, [".a()"]),
 }
 
 
