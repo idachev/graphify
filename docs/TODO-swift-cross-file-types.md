@@ -75,6 +75,12 @@ an unresolved stub. 0c7165fc gives the same nodes and edges for these files (rep
 `tmp/captain/20261023-145049/reviews/ЗД32-r1-triage.md`, F3); it is an extension-only id
 collision, not a nested type id, so ЗД32 leaves it.
 
+**Swift, open (ЗД32 r2, non-blocking).** Each needs an artificial collision (0 cases in 6107 real
+files): r2 F1, inheritance and deeper written references such as `Outer.State.Item` still use the
+unsalted id (`graphify/extractors/engine.py:6428`, `:6789`); r2 F2, descendants of sibling-salted
+types get a needless salt that differs from 0c7165fc (`engine.py:1526`); r2 F5, a nested type that
+collides with an enum case or a computed property can lose that node (`engine.py:1532`).
+
 ## ТД4 Raw `.swift` suffix checks ignore the `.graphifyrc` language override
 
 **Evidence.** These checks test the raw file name instead of `effective_suffix`, so a file
