@@ -48,11 +48,13 @@ def _fresh(tmp_path, files):
     return _calls(extract(paths, root=src, cache_root=tmp_path / "cache", parallel=False))
 
 
-def _rebuild(tmp_path, files, changed):
-    """Full build, then a changed-files rebuild of `changed` with the rest as context."""
+def _rebuild(tmp_path, files, changed, rewrite=None):
+    """Full build, then a changed-files rebuild of `changed` with the rest as context.
+    `rewrite` replaces files on disk between the two builds."""
     src = tmp_path / "src"
     paths = _write(src, files)
     full = extract(paths, root=src, cache_root=tmp_path / "cache-full", parallel=False)
+    _write(src, rewrite or {})
     context_nodes = [{k: n[k] for k in _CONTEXT_NODE_KEYS if k in n} for n in full["nodes"]
                      if n.get("source_file") and n["source_file"] != changed]
     context_edges = [{k: e[k] for k in ("source", "target", "relation", "source_file")}
@@ -124,3 +126,13 @@ def test_rebuild_of_only_a_python_script_binds(tmp_path):
     # No `.py` among the changed paths: the pass must still wake for the script.
     calls = _rebuild(tmp_path, {"inner.py": INNER_PY, "tool": PYTHON_CALLER}, "tool")
     assert (".go()", "inner.py") in _edges_from(calls, "tool_main()")
+
+
+def test_rebuild_unknown_interpreter_target_is_unknown_and_binds(tmp_path):
+    # The unchanged script was extracted as Python, but its shebang now names an
+    # interpreter with no extractor: unknown, so it passes; only a shebang that
+    # maps to a non-Python extractor shuts a script out.
+    wrapped = PYTHON_INNER.replace("python3", "python-wrapper", 1)
+    calls = _rebuild(tmp_path, {"use.py": BARE_USE_PY, "tool": PYTHON_INNER}, "use.py",
+                     rewrite={"tool": wrapped})
+    assert (".go()", "tool") in _edges_from(calls, "run()")

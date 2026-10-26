@@ -5025,12 +5025,14 @@ def _stamp_python_fixture_paths(per_file: "list[dict | None]", root: Path) -> No
 
 def _script_is_python(path: Path) -> "bool | None":
     """The language of an extensionless script, by its shebang, as extraction
-    decides it; None when there is no readable shebang (unknown)."""
+    decides it; None (unknown) when there is no readable shebang or its
+    interpreter maps to no extractor."""
     from graphify.detect import _shebang_interpreter
     interp = _shebang_interpreter(path)
-    if interp is None:
+    extractor = _SHEBANG_DISPATCH.get(interp) if interp is not None else None
+    if extractor is None:
         return None
-    return _SHEBANG_DISPATCH.get(interp) is extract_python
+    return extractor is extract_python
 
 
 def _stamp_script_languages(
