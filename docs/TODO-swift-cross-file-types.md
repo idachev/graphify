@@ -48,15 +48,24 @@ until the next full `graphify extract`. Same for every language pass (review З�
 **Why not here.** It needs a dependency-driven re-extraction of unchanged consumers in the
 incremental pipeline for all languages, outside the scope of a Swift resolver change.
 
-## ТД3 A nested type id can equal a top-level `Outer_State` id
+## ТД3 A Python nested class id can equal a top-level `Outer_State` id
 
-**Evidence.** Phase 3 gives a nested type `_make_id(outer_nid, "State")`, which is the same id
-as a top-level type named `Outer_State` in the same file (`_swift_member_nid`,
-`graphify/extractors/engine.py:6267-6269`; `make_id` joins the parts with `_`,
-`graphify/ids.py:86`). The same limit exists for Python nested classes (review ЗД12 r1 F4).
+**Swift part fixed (ЗД32).** A nested Swift type whose id a declaration of another scope holds
+(top-level `Outer_State` or `outer_state()`, or `Outer.A_B` for `Outer.A.B`) is now salted,
+and the shallower declaration keeps the plain id (`_swift_nested_type_yields`,
+`graphify/extractors/engine.py`; tests in `tests/test_swift_nested_id_collision.py`;
+`_AST_CACHE_SCHEMA` 24).
 
-**Why not here.** The input is artificial and the fix is a change of the id scheme shared with
-Python, outside the task's scope.
+**Evidence (Python, open).** A nested class gets `_make_id(parent_class_nid, "State")`
+(`graphify/extractors/engine.py`, the `tree_sitter_python and parent_class_nid` branch), the
+same id as a top-level `class Outer_State` or `def outer_state()` in the same module: the
+second node is dropped and its methods hang under the nested class (review ЗД12 r1 F4; repro
+P1/P2 in `tmp/captain/20261023-145049/reports/reval-ТД2-ТД3.md`). It exists on upstream v8
+too. A fix must also give the decorator edge the salted owner id: a change only where the
+class id is minted leaves the decorator edge on the unsalted id, which then belongs to the
+top-level declaration (Codex F8); test it with a decorated nested class.
+
+**Why not here.** Pre-existing upstream bug; it goes upstream as its own change.
 
 ## ТД4 Raw `.swift` suffix checks ignore the `.graphifyrc` language override
 
